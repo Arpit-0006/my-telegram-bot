@@ -3,8 +3,9 @@ import datetime
 import logging
 import os
 import re
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Optional, Tuple, List
-from aiohttp import web
 from psycopg2.extras import RealDictCursor
 from psycopg2.pool import SimpleConnectionPool
 
@@ -24,6 +25,29 @@ from telegram.ext import (
 )
 
 # ---------------------------------------------------------
+# LIGHTWEIGHT DUMMY WEB SERVER FOR RENDER HEALTH CHECK
+# ---------------------------------------------------------
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/html')
+        self.end_headers()
+        self.wfile.write(b"Bot is active and running!")
+
+    def log_message(self, format, *args):
+        return
+
+def run_health_check_server():
+    port = int(os.environ.get("PORT", 8080))
+    try:
+        server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+        server.serve_forever()
+    except Exception as e:
+        print(f"Health check server error: {e}")
+
+threading.Thread(target=run_health_check_server, daemon=True).start()
+
+# ---------------------------------------------------------
 # LOGGING CONFIGURATION
 # ---------------------------------------------------------
 logging.basicConfig(
@@ -33,13 +57,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------
-# CONFIGURATION
+# CONFIGURATION & ENVIRONMENT VARIABLES
 # ---------------------------------------------------------
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
 if not TOKEN:
-    raise ValueError("TELEGRAM_BOT_TOKEN Environment Variable missing!")
+    raise ValueError("TELEGRAM_BOT_TOKEN or BOT_TOKEN Missing!")
 
-ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "7572036863"))
+ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID") or os.getenv("ADMIN_ID", "7572036863"))
 
 RAW_DATABASE_URL = os.getenv("DATABASE_URL")
 if not RAW_DATABASE_URL:
@@ -78,20 +102,21 @@ def release_db_connection(conn):
             logger.error(f"Error releasing db conn: {e}")
 
 def init_db():
-    conn = get_db_connection()
+    conn = None
     try:
+        conn = get_db_connection()
         with conn.cursor() as cursor:
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS videos (
                     id SERIAL PRIMARY KEY,
                     title TEXT,
-                    file_id TEXT NOT NULL
+                    file_id TEXT UNIQUE NOT NULL
                 )
             """)
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS subscriptions (
                     user_id BIGINT PRIMARY KEY,
-                    expiry_time TIMESTAMP
+                    expiry_time TIMESTAMP NOT NULL
                 )
             """)
             cursor.execute("""
@@ -104,10 +129,12 @@ def init_db():
             conn.commit()
             logger.info("Database initialized successfully.")
     except Exception as e:
-        conn.rollback()
+        if conn:
+            conn.rollback()
         logger.error(f"Error in init_db: {e}")
     finally:
-        release_db_connection(conn)
+        if conn:
+            release_db_connection(conn)
 
 def log_user_message(user_id: int, message_id: int):
     conn = None
@@ -162,6 +189,9 @@ def cleanup_expired_users():
         if conn:
             release_db_connection(conn)
 
+# ---------------------------------------------------------
+# VIDEO FETCHING & NAVIGATION (INCLUDING RANDOM)
+# ---------------------------------------------------------
 def get_navigated_video(direction: str = "first", current_id: Optional[int] = None) -> Optional[Tuple[int, str, str]]:
     conn = None
     try:
@@ -172,7 +202,11 @@ def get_navigated_video(direction: str = "first", current_id: Optional[int] = No
                 return None
 
             row = None
-            if direction == "next" and current_id is not None:
+            if direction == "random":
+                cursor.execute("SELECT id, title, file_id FROM videos ORDER BY RANDOM() LIMIT 1")
+                row = cursor.fetchone()
+
+            elif direction == "next" and current_id is not None:
                 cursor.execute("SELECT id, title, file_id FROM videos WHERE id > %s ORDER BY id ASC LIMIT 1", (current_id,))
                 row = cursor.fetchone()
                 if not row:
@@ -255,6 +289,9 @@ def get_subscription_details(user_id: int) -> Optional[str]:
             release_db_connection(conn)
 
 def is_user_active(user_id: int) -> bool:
+    if user_id == ADMIN_CHAT_ID:
+        return True
+
     conn = None
     try:
         conn = get_db_connection()
@@ -315,6 +352,14 @@ def get_stats_data() -> Tuple[int, int]:
         if conn:
             release_db_connection(conn)
 
+# Initialize DB on Startup
+try:
+    init_db_pool()
+    init_db()
+    cleanup_expired_users()
+except Exception as err:
+    logger.error(f"Database Init Error: {err}")
+
 # ---------------------------------------------------------
 # INACTIVITY AUTO-CLEANUP MANAGER
 # ---------------------------------------------------------
@@ -343,7 +388,7 @@ async def start_inactivity_timer(context: ContextTypes.DEFAULT_TYPE, user_id: in
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            logger.error(f"Inactivity timer error for user {user_id}: {e}")
+            logger.error(f"Inactivity timer exception: {e}")
         finally:
             USER_INACTIVITY_TASKS.pop(user_id, None)
 
@@ -364,7 +409,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🥈 **Weekly Pass:** ₹50 ➔ 7 Days Access\n"
         "🥇 **Monthly Pass:** ₹150 ➔ 30 Days Access\n"
         "━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "👇 Buy karne ke liye niche button par click karein:"
+        "👇 Choose an option below:"
     )
 
     keyboard = [
@@ -372,6 +417,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🌟 Buy 7 Days Access (₹50)", callback_data="buy_7d")],
         [InlineKeyboardButton("👑 Buy 30 Days Access (₹150)", callback_data="buy_30d")],
         [InlineKeyboardButton("▶️ Open Purchased Course", callback_data="open_course")],
+        [InlineKeyboardButton("🎲 Get Random Video", callback_data="nav_random_0")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -453,6 +499,7 @@ async def render_video_message(context: ContextTypes.DEFAULT_TYPE, user_id: int,
     buttons = [
         [
             InlineKeyboardButton("◀️ Previous", callback_data=f"nav_prev_{video_id}"),
+            InlineKeyboardButton("🎲 Random", callback_data=f"nav_random_{video_id}"),
             InlineKeyboardButton("Next ▶️", callback_data=f"nav_next_{video_id}"),
         ],
         [
@@ -516,8 +563,12 @@ async def handle_navigation(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def check_status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
+
+    if user_id == ADMIN_CHAT_ID:
+        await query.answer("👑 Admin Account: Unlimited Access Active!", show_alert=True)
+        return
+
     expiry = await asyncio.to_thread(get_subscription_details, user_id)
-    
     if expiry:
         await query.answer(f"✅ Your Access Expiry:\n{expiry}", show_alert=True)
     else:
@@ -731,12 +782,12 @@ async def auto_upload_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn = get_db_connection()
             with conn.cursor() as cursor:
                 cursor.execute(
-                    "INSERT INTO videos (title, file_id) VALUES (%s, %s) RETURNING id",
+                    "INSERT INTO videos (title, file_id) VALUES (%s, %s) ON CONFLICT (file_id) DO NOTHING RETURNING id",
                     (caption, file_id)
                 )
-                inserted_id = cursor.fetchone()[0]
+                row = cursor.fetchone()
                 conn.commit()
-                return inserted_id
+                return row[0] if row else "Already Exists"
         except Exception as e:
             if conn:
                 conn.rollback()
@@ -749,7 +800,7 @@ async def auto_upload_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         video_id = await asyncio.to_thread(_insert)
         await update.message.reply_text(
-            f"✅ **Video Saved to Database!**\n🆔 **DB Video ID:** `{video_id}`",
+            f"✅ **Video Saved to Database!**\n🆔 **DB Status/ID:** `{video_id}`",
             parse_mode="Markdown"
         )
     except Exception as err:
@@ -759,34 +810,9 @@ async def auto_upload_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 # ---------------------------------------------------------
-# AIOHTTP HEALTH CHECK SERVER
-# ---------------------------------------------------------
-async def health_check(request):
-    return web.Response(text="Bot is active and running!")
-
-async def start_web_server():
-    port = int(os.environ.get("PORT", 8080))
-    app = web.Application()
-    app.router.add_get("/", health_check)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    logger.info(f"Health check server running on port {port}")
-
-# ---------------------------------------------------------
 # MAIN EXECUTION
 # ---------------------------------------------------------
-async def main():
-    try:
-        init_db_pool()
-        init_db()
-        cleanup_expired_users()
-    except Exception as err:
-        logger.error(f"Database Init Error: {err}")
-
-    await start_web_server()
-
+if __name__ == "__main__":
     app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -806,16 +832,5 @@ async def main():
     app.add_handler(MessageHandler(filters.VIDEO, auto_upload_video))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo_received))
 
-    logger.info("🚀 Production Ready PostgreSQL Bot is Running!")
-    async with app:
-        await app.initialize()
-        await app.start()
-        await app.updater.start_polling(drop_pending_updates=True)
-        # Keep running until process killed
-        await asyncio.Event().wait()
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Bot stopped.")
+    logger.info("🚀 Bot started successfully with Polling mode!")
+    app.run_polling(drop_pending_updates=True)
