@@ -4,8 +4,7 @@ import logging
 import os
 import re
 from typing import Optional, Tuple, List
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import threading
+from aiohttp import web
 from psycopg2.extras import RealDictCursor
 from psycopg2.pool import SimpleConnectionPool
 
@@ -23,26 +22,6 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-
-# ---------------------------------------------------------
-# DUMMY WEB SERVER FOR RENDER HEALTH CHECK
-# ---------------------------------------------------------
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header('Content-type', 'text/html')
-        self.end_headers()
-        self.wfile.write(b"Bot is active and running!")
-
-    def log_message(self, format, *args):
-        return
-
-def run_health_check_server():
-    port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
-    server.serve_forever()
-
-threading.Thread(target=run_health_check_server, daemon=True).start()
 
 # ---------------------------------------------------------
 # LOGGING CONFIGURATION
@@ -149,8 +128,9 @@ def log_user_message(user_id: int, message_id: int):
             release_db_connection(conn)
 
 def get_and_clear_user_messages(user_id: int) -> List[int]:
-    conn = get_db_connection()
+    conn = None
     try:
+        conn = get_db_connection()
         with conn.cursor(cursor_factory=RealDictCursor) as cursor:
             cursor.execute("SELECT message_id FROM user_messages WHERE user_id = %s", (user_id,))
             rows = cursor.fetchall()
@@ -158,28 +138,34 @@ def get_and_clear_user_messages(user_id: int) -> List[int]:
             conn.commit()
             return [r["message_id"] for r in rows]
     except Exception as e:
-        conn.rollback()
+        if conn:
+            conn.rollback()
         logger.error(f"Error getting/clearing user messages: {e}")
         return []
     finally:
-        release_db_connection(conn)
+        if conn:
+            release_db_connection(conn)
 
 def cleanup_expired_users():
     now = datetime.datetime.now()
-    conn = get_db_connection()
+    conn = None
     try:
+        conn = get_db_connection()
         with conn.cursor() as cursor:
             cursor.execute("DELETE FROM subscriptions WHERE expiry_time <= %s", (now,))
             conn.commit()
     except Exception as e:
-        conn.rollback()
+        if conn:
+            conn.rollback()
         logger.error(f"Error cleaning expired users: {e}")
     finally:
-        release_db_connection(conn)
+        if conn:
+            release_db_connection(conn)
 
 def get_navigated_video(direction: str = "first", current_id: Optional[int] = None) -> Optional[Tuple[int, str, str]]:
-    conn = get_db_connection()
+    conn = None
     try:
+        conn = get_db_connection()
         with conn.cursor(cursor_factory=RealDictCursor) as cursor:
             cursor.execute("SELECT COUNT(*) as count FROM videos")
             if cursor.fetchone()["count"] == 0:
@@ -206,16 +192,19 @@ def get_navigated_video(direction: str = "first", current_id: Optional[int] = No
 
             return (row["id"], row["title"], row["file_id"]) if row else None
     except Exception as e:
-        conn.rollback()
+        if conn:
+            conn.rollback()
         logger.error(f"Error in get_navigated_video: {e}")
         return None
     finally:
-        release_db_connection(conn)
+        if conn:
+            release_db_connection(conn)
 
 def set_user_subscription(user_id: int, hours: int):
     expiry = datetime.datetime.now() + datetime.timedelta(hours=hours)
-    conn = get_db_connection()
+    conn = None
     try:
+        conn = get_db_connection()
         with conn.cursor() as cursor:
             cursor.execute("""
                 INSERT INTO subscriptions (user_id, expiry_time)
@@ -224,42 +213,51 @@ def set_user_subscription(user_id: int, hours: int):
             """, (user_id, expiry))
             conn.commit()
     except Exception as e:
-        conn.rollback()
+        if conn:
+            conn.rollback()
         logger.error(f"Error setting subscription: {e}")
     finally:
-        release_db_connection(conn)
+        if conn:
+            release_db_connection(conn)
 
 def remove_user_subscription(user_id: int) -> bool:
-    conn = get_db_connection()
+    conn = None
     try:
+        conn = get_db_connection()
         with conn.cursor() as cursor:
             cursor.execute("DELETE FROM subscriptions WHERE user_id = %s", (user_id,))
             deleted = cursor.rowcount > 0
             conn.commit()
             return deleted
     except Exception as e:
-        conn.rollback()
+        if conn:
+            conn.rollback()
         logger.error(f"Error removing subscription: {e}")
         return False
     finally:
-        release_db_connection(conn)
+        if conn:
+            release_db_connection(conn)
 
 def get_subscription_details(user_id: int) -> Optional[str]:
-    conn = get_db_connection()
+    conn = None
     try:
+        conn = get_db_connection()
         with conn.cursor(cursor_factory=RealDictCursor) as cursor:
             cursor.execute("SELECT expiry_time FROM subscriptions WHERE user_id = %s", (user_id,))
             row = cursor.fetchone()
             return row["expiry_time"].strftime("%Y-%m-%d %H:%M:%S") if row else None
     except Exception as e:
-        conn.rollback()
+        if conn:
+            conn.rollback()
         return None
     finally:
-        release_db_connection(conn)
+        if conn:
+            release_db_connection(conn)
 
 def is_user_active(user_id: int) -> bool:
-    conn = get_db_connection()
+    conn = None
     try:
+        conn = get_db_connection()
         with conn.cursor(cursor_factory=RealDictCursor) as cursor:
             cursor.execute("SELECT expiry_time FROM subscriptions WHERE user_id = %s", (user_id,))
             row = cursor.fetchone()
@@ -275,28 +273,34 @@ def is_user_active(user_id: int) -> bool:
 
             return True
     except Exception as e:
-        conn.rollback()
+        if conn:
+            conn.rollback()
         return False
     finally:
-        release_db_connection(conn)
+        if conn:
+            release_db_connection(conn)
 
 def get_all_active_users() -> List[int]:
     now = datetime.datetime.now()
-    conn = get_db_connection()
+    conn = None
     try:
+        conn = get_db_connection()
         with conn.cursor(cursor_factory=RealDictCursor) as cursor:
             cursor.execute("SELECT user_id FROM subscriptions WHERE expiry_time > %s", (now,))
             return [row["user_id"] for row in cursor.fetchall()]
     except Exception as e:
-        conn.rollback()
+        if conn:
+            conn.rollback()
         return []
     finally:
-        release_db_connection(conn)
+        if conn:
+            release_db_connection(conn)
 
 def get_stats_data() -> Tuple[int, int]:
     now = datetime.datetime.now()
-    conn = get_db_connection()
+    conn = None
     try:
+        conn = get_db_connection()
         with conn.cursor(cursor_factory=RealDictCursor) as cursor:
             cursor.execute("SELECT COUNT(*) as count FROM videos")
             total_videos = cursor.fetchone()["count"]
@@ -304,18 +308,12 @@ def get_stats_data() -> Tuple[int, int]:
             active_users = cursor.fetchone()["count"]
             return total_videos, active_users
     except Exception as e:
-        conn.rollback()
+        if conn:
+            conn.rollback()
         return 0, 0
     finally:
-        release_db_connection(conn)
-
-# Database Initialization
-try:
-    init_db_pool()
-    init_db()
-    cleanup_expired_users()
-except Exception as err:
-    logger.error(f"Database Init Error: {err}")
+        if conn:
+            release_db_connection(conn)
 
 # ---------------------------------------------------------
 # INACTIVITY AUTO-CLEANUP MANAGER
@@ -344,6 +342,8 @@ async def start_inactivity_timer(context: ContextTypes.DEFAULT_TYPE, user_id: in
 
         except asyncio.CancelledError:
             pass
+        except Exception as e:
+            logger.error(f"Inactivity timer error for user {user_id}: {e}")
         finally:
             USER_INACTIVITY_TASKS.pop(user_id, None)
 
@@ -726,8 +726,9 @@ async def auto_upload_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption = update.message.caption or ""
 
     def _insert():
-        conn = get_db_connection()
+        conn = None
         try:
+            conn = get_db_connection()
             with conn.cursor() as cursor:
                 cursor.execute(
                     "INSERT INTO videos (title, file_id) VALUES (%s, %s) RETURNING id",
@@ -737,11 +738,13 @@ async def auto_upload_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 conn.commit()
                 return inserted_id
         except Exception as e:
-            conn.rollback()
+            if conn:
+                conn.rollback()
             logger.error(f"Error inserting video: {e}")
             raise e
         finally:
-            release_db_connection(conn)
+            if conn:
+                release_db_connection(conn)
 
     try:
         video_id = await asyncio.to_thread(_insert)
@@ -756,9 +759,34 @@ async def auto_upload_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 # ---------------------------------------------------------
+# AIOHTTP HEALTH CHECK SERVER
+# ---------------------------------------------------------
+async def health_check(request):
+    return web.Response(text="Bot is active and running!")
+
+async def start_web_server():
+    port = int(os.environ.get("PORT", 8080))
+    app = web.Application()
+    app.router.add_get("/", health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"Health check server running on port {port}")
+
+# ---------------------------------------------------------
 # MAIN EXECUTION
 # ---------------------------------------------------------
-if __name__ == "__main__":
+async def main():
+    try:
+        init_db_pool()
+        init_db()
+        cleanup_expired_users()
+    except Exception as err:
+        logger.error(f"Database Init Error: {err}")
+
+    await start_web_server()
+
     app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -779,4 +807,15 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo_received))
 
     logger.info("🚀 Production Ready PostgreSQL Bot is Running!")
-    app.run_polling(drop_pending_updates=True)
+    async with app:
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling(drop_pending_updates=True)
+        # Keep running until process killed
+        await asyncio.Event().wait()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Bot stopped.")
