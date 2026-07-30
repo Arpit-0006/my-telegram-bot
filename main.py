@@ -159,25 +159,35 @@ def cleanup_expired_users():
     finally:
         release_db_connection(conn)
 
-def get_random_video(exclude_id: Optional[int] = None) -> Optional[Tuple[int, str, str]]:
+# --- DIRECTED NAVIGATION VIDEO FETCHING ---
+def get_navigated_video(direction: str = "first", current_id: Optional[int] = None) -> Optional[Tuple[int, str, str]]:
     """
-    Selects a random video. If exclude_id is provided, tries to select 
-    a different video so the same video doesn't repeat continuously.
+    Fetches Next, Previous, or Initial video cleanly without random overlapping.
     """
     conn = get_db_connection()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-            if exclude_id is not None:
-                cursor.execute(
-                    "SELECT id, title, file_id FROM videos WHERE id != %s ORDER BY RANDOM() LIMIT 1",
-                    (exclude_id,)
-                )
+            row = None
+            if direction == "next" and current_id is not None:
+                cursor.execute("SELECT id, title, file_id FROM videos WHERE id > %s ORDER BY id ASC LIMIT 1", (current_id,))
                 row = cursor.fetchone()
-                if row:
-                    return (row["id"], row["title"], row["file_id"])
-            
-            cursor.execute("SELECT id, title, file_id FROM videos ORDER BY RANDOM() LIMIT 1")
-            row = cursor.fetchone()
+                # If end of playlist, loop back to first video
+                if not row:
+                    cursor.execute("SELECT id, title, file_id FROM videos ORDER BY id ASC LIMIT 1")
+                    row = cursor.fetchone()
+
+            elif direction == "prev" and current_id is not None:
+                cursor.execute("SELECT id, title, file_id FROM videos WHERE id < %s ORDER BY id DESC LIMIT 1", (current_id,))
+                row = cursor.fetchone()
+                # If start of playlist, loop back to last video
+                if not row:
+                    cursor.execute("SELECT id, title, file_id FROM videos ORDER BY id DESC LIMIT 1")
+                    row = cursor.fetchone()
+
+            else:
+                cursor.execute("SELECT id, title, file_id FROM videos ORDER BY id ASC LIMIT 1")
+                row = cursor.fetchone()
+
             return (row["id"], row["title"], row["file_id"]) if row else None
     finally:
         release_db_connection(conn)
@@ -319,9 +329,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     keyboard = [
-        [InlineKeyboardButton("💳 Buy 24 Hours Access (₹10)", callback_data="buy_24h")],
-        [InlineKeyboardButton("💳 Buy 7 Days Access (₹50)", callback_data="buy_7d")],
-        [InlineKeyboardButton("💳 Buy 30 Days Access (₹150)", callback_data="buy_30d")],
+        [InlineKeyboardButton("💎 Buy 24 Hours Access (₹10)", callback_data="buy_24h")],
+        [InlineKeyboardButton("🌟 Buy 7 Days Access (₹50)", callback_data="buy_7d")],
+        [InlineKeyboardButton("👑 Buy 30 Days Access (₹150)", callback_data="buy_30d")],
         [InlineKeyboardButton("▶️ Open Purchased Course", callback_data="open_course")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -386,10 +396,10 @@ async def open_course(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await asyncio.to_thread(log_user_message, user_id, msg.message_id)
         return
 
-    await render_video_message(context, user_id, edit_query=None)
+    await render_video_message(context, user_id, edit_query=None, direction="first")
 
-async def render_video_message(context: ContextTypes.DEFAULT_TYPE, user_id: int, edit_query=None, current_video_id: Optional[int] = None):
-    video = await asyncio.to_thread(get_random_video, current_video_id)
+async def render_video_message(context: ContextTypes.DEFAULT_TYPE, user_id: int, edit_query=None, direction: str = "first", current_video_id: Optional[int] = None):
+    video = await asyncio.to_thread(get_navigated_video, direction, current_video_id)
     if not video:
         msg_text = "⚠️ Course me abhi koi video uploaded nahi hai."
         if edit_query:
@@ -401,10 +411,15 @@ async def render_video_message(context: ContextTypes.DEFAULT_TYPE, user_id: int,
 
     video_id, title, file_id = video
 
+    # UPGRADED HIGH-QUALITY INTERACTIVE BUTTONS
     buttons = [
         [
-            InlineKeyboardButton("⬅️ Prev", callback_data=f"nav_random_{video_id}"),
-            InlineKeyboardButton("Next ➡️", callback_data=f"nav_random_{video_id}"),
+            InlineKeyboardButton("◀️ Previous", callback_data=f"nav_prev_{video_id}"),
+            InlineKeyboardButton("Next ▶️", callback_data=f"nav_next_{video_id}"),
+        ],
+        [
+            InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu"),
+            InlineKeyboardButton("📊 Access Status", callback_data="check_status"),
         ]
     ]
     reply_markup = InlineKeyboardMarkup(buttons)
@@ -446,7 +461,7 @@ async def render_video_message(context: ContextTypes.DEFAULT_TYPE, user_id: int,
 
 async def handle_navigation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await query.answer("Loading video...")  # Instant loader feedback
     user_id = query.from_user.id
 
     if not await asyncio.to_thread(is_user_active, user_id):
@@ -454,12 +469,21 @@ async def handle_navigation(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await asyncio.to_thread(log_user_message, user_id, msg.message_id)
         return
 
-    current_video_id = None
     data_parts = query.data.split("_")
-    if len(data_parts) > 2 and data_parts[2].isdigit():
-        current_video_id = int(data_parts[2])
+    direction = data_parts[1]  # 'prev' or 'next'
+    current_video_id = int(data_parts[2]) if len(data_parts) > 2 and data_parts[2].isdigit() else None
 
-    await render_video_message(context, user_id, edit_query=query, current_video_id=current_video_id)
+    await render_video_message(context, user_id, edit_query=query, direction=direction, current_video_id=current_video_id)
+
+async def check_status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    expiry = await asyncio.to_thread(get_subscription_details, user_id)
+    
+    if expiry:
+        await query.answer(f"✅ Your Access Expiry:\n{expiry}", show_alert=True)
+    else:
+        await query.answer("❌ No active access plan found.", show_alert=True)
 
 # ---------------------------------------------------------
 # ADMIN COMMANDS
@@ -681,6 +705,7 @@ if __name__ == "__main__":
     app.add_handler(CallbackQueryHandler(open_course, pattern="^open_course$"))
     app.add_handler(CallbackQueryHandler(start, pattern="^main_menu$"))
     app.add_handler(CallbackQueryHandler(handle_navigation, pattern="^nav_"))
+    app.add_handler(CallbackQueryHandler(check_status_callback, pattern="^check_status$"))
 
     app.add_handler(CommandHandler("grant", grant_cmd))
     app.add_handler(CommandHandler("revoke", revoke_cmd))
