@@ -159,10 +159,23 @@ def cleanup_expired_users():
     finally:
         release_db_connection(conn)
 
-def get_random_video() -> Optional[Tuple[int, str, str]]:
+def get_random_video(exclude_id: Optional[int] = None) -> Optional[Tuple[int, str, str]]:
+    """
+    Selects a random video. If exclude_id is provided, tries to select 
+    a different video so the same video doesn't repeat continuously.
+    """
     conn = get_db_connection()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+            if exclude_id is not None:
+                cursor.execute(
+                    "SELECT id, title, file_id FROM videos WHERE id != %s ORDER BY RANDOM() LIMIT 1",
+                    (exclude_id,)
+                )
+                row = cursor.fetchone()
+                if row:
+                    return (row["id"], row["title"], row["file_id"])
+            
             cursor.execute("SELECT id, title, file_id FROM videos ORDER BY RANDOM() LIMIT 1")
             row = cursor.fetchone()
             return (row["id"], row["title"], row["file_id"]) if row else None
@@ -375,8 +388,8 @@ async def open_course(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await render_video_message(context, user_id, edit_query=None)
 
-async def render_video_message(context: ContextTypes.DEFAULT_TYPE, user_id: int, edit_query=None):
-    video = await asyncio.to_thread(get_random_video)
+async def render_video_message(context: ContextTypes.DEFAULT_TYPE, user_id: int, edit_query=None, current_video_id: Optional[int] = None):
+    video = await asyncio.to_thread(get_random_video, current_video_id)
     if not video:
         msg_text = "⚠️ Course me abhi koi video uploaded nahi hai."
         if edit_query:
@@ -390,8 +403,8 @@ async def render_video_message(context: ContextTypes.DEFAULT_TYPE, user_id: int,
 
     buttons = [
         [
-            InlineKeyboardButton("⬅️ Prev", callback_data="nav_random"),
-            InlineKeyboardButton("Next ➡️", callback_data="nav_random"),
+            InlineKeyboardButton("⬅️ Prev", callback_data=f"nav_random_{video_id}"),
+            InlineKeyboardButton("Next ➡️", callback_data=f"nav_random_{video_id}"),
         ]
     ]
     reply_markup = InlineKeyboardMarkup(buttons)
@@ -441,7 +454,12 @@ async def handle_navigation(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await asyncio.to_thread(log_user_message, user_id, msg.message_id)
         return
 
-    await render_video_message(context, user_id, edit_query=query)
+    current_video_id = None
+    data_parts = query.data.split("_")
+    if len(data_parts) > 2 and data_parts[2].isdigit():
+        current_video_id = int(data_parts[2])
+
+    await render_video_message(context, user_id, edit_query=query, current_video_id=current_video_id)
 
 # ---------------------------------------------------------
 # ADMIN COMMANDS
