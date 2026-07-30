@@ -2,7 +2,6 @@ import asyncio
 import datetime
 import logging
 import os
-import re
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import psycopg2
@@ -23,14 +22,14 @@ from telegram.ext import (
 )
 
 # ---------------------------------------------------------
-# RENDER HEALTH CHECK SERVER (PORT BINDING FIX)
+# RENDER HEALTH CHECK SERVER
 # ---------------------------------------------------------
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header('Content-type', 'text/html')
         self.end_headers()
-        self.wfile.write(b"Bot is live and running!")
+        self.wfile.write(b"Bot is live!")
 
     def log_message(self, format, *args):
         return
@@ -66,10 +65,12 @@ if RAW_DATABASE_URL and RAW_DATABASE_URL.startswith("postgres://"):
 else:
     DATABASE_URL = RAW_DATABASE_URL
 
-# Default QR Code File ID
 QR_FILE_ID = os.getenv("QR_FILE_ID", "AgACAgUAAxkBAAMFamo9AXr8yxJhM9AJuipowCr2a9UAAvobaxtNyVFXq59REp-3CE8BAAMCAAN5AAM9BA")
 
 USER_QR_MESSAGES = {}
+
+# LOCK DICTIONARY FOR PREVENTING MULTIPLE FAST CLICKS
+USER_LOCKS = {}
 
 # ---------------------------------------------------------
 # DATABASE HELPERS
@@ -97,7 +98,7 @@ def init_db():
         conn.commit()
         cur.close()
         conn.close()
-        logger.info("Database setup completed successfully.")
+        logger.info("Database initialized.")
     except Exception as e:
         logger.error(f"Database Init Error: {e}")
 
@@ -301,41 +302,53 @@ async def open_course(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
+# FAST CLICK FIX (LOCK MECHANISM)
 async def handle_navigation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     user_id = query.from_user.id
 
-    if not await asyncio.to_thread(is_user_subscribed_db, user_id):
-        await query.message.reply_text("🔒 Subscription Expired! Access lene ke liye /start karein.")
+    # Initialize lock for user if not exists
+    if user_id not in USER_LOCKS:
+        USER_LOCKS[user_id] = asyncio.Lock()
+
+    # If lock is locked, user is clicking too fast. Ignore extra clicks.
+    if USER_LOCKS[user_id].locked():
+        await query.answer("⏳ Wait a second, loading video...")
         return
 
-    video = await asyncio.to_thread(get_random_video_db)
-    if not video:
-        await query.message.reply_text("⚠️ Database me koi video nahi mili.")
-        return
+    async with USER_LOCKS[user_id]:
+        await query.answer()
 
-    # Delete previous video message (Chat me hamesha sirf 1 video rahegi)
-    try:
-        await query.message.delete()
-    except Exception as e:
-        logger.warning(f"Failed to delete previous video: {e}")
+        if not await asyncio.to_thread(is_user_subscribed_db, user_id):
+            await query.message.reply_text("🔒 Subscription Expired! Access lene ke liye /start karein.")
+            return
 
-    # Send new random video
-    await context.bot.send_video(
-        chat_id=query.message.chat_id,
-        video=video['file_id'],
-        caption=video['caption'] or "✨ *Premium Video*",
-        reply_markup=get_nav_keyboard(),
-        parse_mode="Markdown"
-    )
+        video = await asyncio.to_thread(get_random_video_db)
+        if not video:
+            await query.message.reply_text("⚠️ Database me koi video nahi mili.")
+            return
+
+        # 1. PURANI VIDEO DELETE
+        try:
+            await query.message.delete()
+        except Exception as e:
+            logger.warning(f"Failed to delete previous video: {e}")
+
+        # 2. NAYI VIDEO SEND
+        await context.bot.send_video(
+            chat_id=query.message.chat_id,
+            video=video['file_id'],
+            caption=video['caption'] or "✨ *Premium Video*",
+            reply_markup=get_nav_keyboard(),
+            parse_mode="Markdown"
+        )
 
 async def check_status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
 
     if user_id == ADMIN_ID:
-        await query.answer("👑 Admin Account: Unlimited Lifetime Access!", show_alert=True)
+        await query.answer("👑 Admin Account: Unlimited Access!", show_alert=True)
         return
 
     expiry = await asyncio.to_thread(get_subscription_details_db, user_id)
@@ -531,7 +544,7 @@ def main():
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # User Command Handlers
+    # User Handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_buy, pattern="^buy_"))
     app.add_handler(CallbackQueryHandler(open_course, pattern="^open_course$"))
@@ -539,19 +552,19 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_navigation, pattern="^nav_"))
     app.add_handler(CallbackQueryHandler(check_status_callback, pattern="^check_status$"))
 
-    # Admin Command Handlers
+    # Admin Handlers
     app.add_handler(CommandHandler("grant", grant_cmd))
     app.add_handler(CommandHandler("revoke", revoke_cmd))
     app.add_handler(CommandHandler("userinfo", userinfo_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
 
-    # Media & Approval Handlers
+    # Media Handlers
     app.add_handler(CallbackQueryHandler(handle_approval, pattern="^(app_|rej_)"))
     app.add_handler(MessageHandler(filters.VIDEO, auto_upload_video))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo_received))
 
-    logger.info("Bot is active and polling...")
+    logger.info("Bot is active and running...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
