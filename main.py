@@ -74,7 +74,7 @@ USER_QR_MESSAGES = {}
 USER_LOCKS = {}
 
 # ---------------------------------------------------------
-# 3. DATABASE CONNECTION & SCHEMAS
+# 3. DATABASE CONNECTION & SCHEMAS (OPTIMIZED)
 # ---------------------------------------------------------
 def get_db():
     if not DATABASE_URL:
@@ -86,14 +86,13 @@ def get_db():
     else:
         url_with_ssl = DATABASE_URL
         
-    return psycopg2.connect(url_with_ssl, cursor_factory=RealDictCursor, connect_timeout=10)
+    return psycopg2.connect(url_with_ssl, cursor_factory=RealDictCursor, connect_timeout=15)
 
 def init_db():
     conn = None
     try:
         conn = get_db()
         with conn.cursor() as cur:
-            # 1. Base table creation
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS videos (
                     id SERIAL PRIMARY KEY,
@@ -101,14 +100,10 @@ def init_db():
                     caption TEXT
                 );
             """)
-            
-            # 2. Safe Column Migration
             cur.execute("""
                 ALTER TABLE videos 
                 ADD COLUMN IF NOT EXISTS caption TEXT;
             """)
-
-            # 3. Create Subscriptions table
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS subscriptions (
                     user_id BIGINT PRIMARY KEY,
@@ -116,7 +111,7 @@ def init_db():
                 );
             """)
             conn.commit()
-        logger.info("✅ Database initialized & migrated successfully.")
+        logger.info("✅ Database initialized successfully.")
     except Exception as e:
         logger.error(f"❌ Database Init Error: {e}")
     finally:
@@ -158,11 +153,16 @@ def is_user_subscribed_db(user_id: int) -> bool:
     try:
         conn = get_db()
         with conn.cursor() as cur:
+            # Postgres DB ka Current Time and Subscription Expiry match
             cur.execute("SELECT expiry_time FROM subscriptions WHERE user_id = %s;", (user_id,))
             row = cur.fetchone()
-            if row and row['expiry_time'] > datetime.datetime.now(datetime.timezone.utc):
-                return True
-            return False
+            if not row:
+                return False
+            
+            # Direct SQL Time comparison to fix UTC/Local Server Time zone issues
+            cur.execute("SELECT (%s > NOW()) as is_valid;", (row['expiry_time'],))
+            res = cur.fetchone()
+            return res['is_valid'] if res else False
     except Exception as e:
         logger.error(f"DB Error (is_user_subscribed_db): {e}")
         return False
@@ -171,16 +171,17 @@ def is_user_subscribed_db(user_id: int) -> bool:
             conn.close()
 
 def set_user_subscription_db(user_id: int, hours: int):
-    expiry = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=hours)
     conn = None
     try:
         conn = get_db()
         with conn.cursor() as cur:
+            # Dynamic interval addition inside SQL engine
             cur.execute("""
                 INSERT INTO subscriptions (user_id, expiry_time)
-                VALUES (%s, %s)
-                ON CONFLICT (user_id) DO UPDATE SET expiry_time = EXCLUDED.expiry_time;
-            """, (user_id, expiry))
+                VALUES (%s, NOW() + (%s || ' hours')::INTERVAL)
+                ON CONFLICT (user_id) DO UPDATE 
+                SET expiry_time = GREATEST(subscriptions.expiry_time, NOW()) + (%s || ' hours')::INTERVAL;
+            """, (user_id, str(hours), str(hours)))
             conn.commit()
     except Exception as e:
         logger.error(f"DB Error (set_user_subscription_db): {e}")
@@ -226,7 +227,7 @@ def get_stats_data_db():
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) as count FROM videos;")
             v_count = cur.fetchone()['count']
-            cur.execute("SELECT COUNT(*) as count FROM subscriptions WHERE expiry_time > %s;", (datetime.datetime.now(datetime.timezone.utc),))
+            cur.execute("SELECT COUNT(*) as count FROM subscriptions WHERE expiry_time > NOW();")
             u_count = cur.fetchone()['count']
             return v_count, u_count
     except Exception as e:
@@ -241,7 +242,7 @@ def get_all_active_users_db():
     try:
         conn = get_db()
         with conn.cursor() as cur:
-            cur.execute("SELECT user_id FROM subscriptions WHERE expiry_time > %s;", (datetime.datetime.now(datetime.timezone.utc),))
+            cur.execute("SELECT user_id FROM subscriptions WHERE expiry_time > NOW();")
             return [row['user_id'] for row in cur.fetchall()]
     except Exception as e:
         logger.error(f"DB Error (get_all_active_users_db): {e}")
@@ -429,13 +430,13 @@ async def check_status_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     expiry = await asyncio.to_thread(get_subscription_details_db, user_id)
-    if expiry:
+    if expiry and await asyncio.to_thread(is_user_subscribed_db, user_id):
         await query.answer(f"✅ Access Active Until:\n{expiry}", show_alert=True)
     else:
-        await query.answer("❌ No active subscription found.", show_alert=True)
+        await query.answer("❌ Subscription Expired or Inactive.", show_alert=True)
 
 # ---------------------------------------------------------
-# 6. AUTO VIDEO SAVE & PAYMENT HANDLERS
+# 6. FAST AUTO VIDEO SAVE & PAYMENT HANDLERS
 # ---------------------------------------------------------
 async def handle_photo_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -510,6 +511,7 @@ async def auto_upload_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # Super Fast Extracting Video ID
     file_id = None
     if update.message.video:
         file_id = update.message.video.file_id
@@ -522,36 +524,31 @@ async def auto_upload_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     caption = update.message.caption or ""
 
-    def _insert():
+    def _quick_insert():
         conn = None
         try:
             conn = get_db()
             with conn.cursor() as cur:
-                # 1. Check if video exists without relying on ON CONFLICT constraints
-                cur.execute("SELECT id FROM videos WHERE file_id = %s;", (file_id,))
-                if cur.fetchone():
-                    return False  # Already exists
-                
-                # 2. Insert new video
+                # Optimized Single SQL Query Execution
                 cur.execute(
-                    "INSERT INTO videos (file_id, caption) VALUES (%s, %s);",
+                    "INSERT INTO videos (file_id, caption) VALUES (%s, %s) ON CONFLICT (file_id) DO NOTHING;",
                     (file_id, caption)
                 )
                 conn.commit()
-                return True  # Saved
+                return cur.rowcount
         finally:
             if conn:
                 conn.close()
 
     try:
-        is_saved = await asyncio.to_thread(_insert)
-        if is_saved:
-            await update.message.reply_text("✅ Video Database me successfully save ho gayi!")
+        rows = await asyncio.to_thread(_quick_insert)
+        if rows > 0:
+            await update.message.reply_text("⚡ Video Instant Save ho gayi!")
         else:
-            await update.message.reply_text("ℹ️ Ye Video pehle se Database me save hai.")
+            await update.message.reply_text("ℹ️ Ye Video pehle se Database me hai.")
     except Exception as e:
         logger.error(f"Video Save DB Error: {e}")
-        await update.message.reply_text(f"❌ Database Save Error: {str(e)}")
+        await update.message.reply_text(f"❌ Save Error: {str(e)}")
 
 # ---------------------------------------------------------
 # 7. ADMIN COMMANDS
