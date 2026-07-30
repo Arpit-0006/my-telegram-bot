@@ -6,7 +6,6 @@ import re
 from typing import Optional, Tuple, List
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
-import psycopg2
 from psycopg2.extras import RealDictCursor
 from psycopg2.pool import SimpleConnectionPool
 
@@ -89,7 +88,10 @@ def get_db_connection():
 
 def release_db_connection(conn):
     if db_pool and conn:
-        db_pool.putconn(conn)
+        try:
+            db_pool.putconn(conn)
+        except Exception as e:
+            logger.error(f"Error releasing db conn: {e}")
 
 def init_db():
     conn = get_db_connection()
@@ -401,7 +403,6 @@ async def render_video_message(context: ContextTypes.DEFAULT_TYPE, user_id: int,
         if filtered_title:
             clean_caption = f"🎬 **{filtered_title}**\n\n✨ *Exclusive Premium Content*"
 
-    # AGAR NAVIGATION (PREV/NEXT) SE AAYA HAI: SAME MESSAGE EDIT HOGA
     if edit_query:
         try:
             await edit_query.edit_message_media(
@@ -419,7 +420,6 @@ async def render_video_message(context: ContextTypes.DEFAULT_TYPE, user_id: int,
             except Exception:
                 pass
 
-    # FIRST TIME YA EDIT FAIL HONE PAR SAFE SINGLE NEW VIDEO MESSAGE
     sent_msg = await context.bot.send_video(
         chat_id=user_id,
         video=file_id,
