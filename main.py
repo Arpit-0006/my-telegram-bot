@@ -11,6 +11,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Update,
+    InputMediaVideo
 )
 from telegram.ext import (
     ApplicationBuilder,
@@ -22,14 +23,14 @@ from telegram.ext import (
 )
 
 # ---------------------------------------------------------
-# RENDER HEALTH CHECK SERVER
+# 1. RENDER HEALTH CHECK SERVER
 # ---------------------------------------------------------
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header('Content-type', 'text/html')
         self.end_headers()
-        self.wfile.write(b"Bot is live!")
+        self.wfile.write(b"Bot status: ONLINE")
 
     def log_message(self, format, *args):
         return
@@ -40,12 +41,12 @@ def run_health_check_server():
         server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
         server.serve_forever()
     except Exception as e:
-        print(f"Health check server error: {e}")
+        print(f"Health Check Server Notice: {e}")
 
 threading.Thread(target=run_health_check_server, daemon=True).start()
 
 # ---------------------------------------------------------
-# LOGGING CONFIGURATION
+# 2. LOGGING & CONFIGURATION
 # ---------------------------------------------------------
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -53,9 +54,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------
-# ENVIRONMENT VARIABLES
-# ---------------------------------------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
 RAW_DATABASE_URL = os.getenv("DATABASE_URL")
 ADMIN_ID = int(os.getenv("ADMIN_ID") or os.getenv("ADMIN_CHAT_ID", "0"))
@@ -68,143 +66,169 @@ else:
 QR_FILE_ID = os.getenv("QR_FILE_ID", "AgACAgUAAxkBAAMFamo9AXr8yxJhM9AJuipowCr2a9UAAvobaxtNyVFXq59REp-3CE8BAAMCAAN5AAM9BA")
 
 USER_QR_MESSAGES = {}
-
-# LOCK DICTIONARY FOR PREVENTING MULTIPLE FAST CLICKS
 USER_LOCKS = {}
 
 # ---------------------------------------------------------
-# DATABASE HELPERS
+# 3. DATABASE HELPER FUNCTIONS
 # ---------------------------------------------------------
 def get_db():
-    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor, connect_timeout=10)
 
 def init_db():
+    conn = None
     try:
         conn = get_db()
-        cur = conn.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS videos (
-                id SERIAL PRIMARY KEY,
-                file_id VARCHAR(255) UNIQUE NOT NULL,
-                caption TEXT
-            );
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS subscriptions (
-                user_id BIGINT PRIMARY KEY,
-                expiry_time TIMESTAMP NOT NULL
-            );
-        """)
-        conn.commit()
-        cur.close()
-        conn.close()
-        logger.info("Database initialized.")
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS videos (
+                    id SERIAL PRIMARY KEY,
+                    file_id VARCHAR(255) UNIQUE NOT NULL,
+                    caption TEXT
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS subscriptions (
+                    user_id BIGINT PRIMARY KEY,
+                    expiry_time TIMESTAMP WITH TIME ZONE NOT NULL
+                );
+            """)
+            conn.commit()
+        logger.info("Database initialized successfully.")
     except Exception as e:
         logger.error(f"Database Init Error: {e}")
+    finally:
+        if conn:
+            conn.close()
 
 def get_random_video_db():
+    conn = None
     try:
         conn = get_db()
-        cur = conn.cursor()
-        cur.execute("SELECT file_id, caption FROM videos ORDER BY RANDOM() LIMIT 1;")
-        video = cur.fetchone()
-        cur.close()
-        conn.close()
-        return video
+        with conn.cursor() as cur:
+            cur.execute("SELECT file_id, caption FROM videos ORDER BY RANDOM() LIMIT 1;")
+            return cur.fetchone()
     except Exception as e:
         logger.error(f"DB Error (get_random_video_db): {e}")
         return None
+    finally:
+        if conn:
+            conn.close()
+
+def get_video_by_file_id(file_id: str):
+    conn = None
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute("SELECT file_id, caption FROM videos WHERE file_id = %s;", (file_id,))
+            return cur.fetchone()
+    except Exception as e:
+        logger.error(f"DB Error (get_video_by_file_id): {e}")
+        return None
+    finally:
+        if conn:
+            conn.close()
 
 def is_user_subscribed_db(user_id: int) -> bool:
     if user_id == ADMIN_ID:
         return True
+    conn = None
     try:
         conn = get_db()
-        cur = conn.cursor()
-        cur.execute("SELECT expiry_time FROM subscriptions WHERE user_id = %s;", (user_id,))
-        row = cur.fetchone()
-        cur.close()
-        conn.close()
-        if row and row['expiry_time'] > datetime.datetime.now():
-            return True
-        return False
+        with conn.cursor() as cur:
+            cur.execute("SELECT expiry_time FROM subscriptions WHERE user_id = %s;", (user_id,))
+            row = cur.fetchone()
+            if row and row['expiry_time'] > datetime.datetime.now(datetime.timezone.utc):
+                return True
+            return False
     except Exception as e:
         logger.error(f"DB Error (is_user_subscribed_db): {e}")
         return False
+    finally:
+        if conn:
+            conn.close()
 
 def set_user_subscription_db(user_id: int, hours: int):
-    expiry = datetime.datetime.now() + datetime.timedelta(hours=hours)
+    expiry = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=hours)
+    conn = None
     try:
         conn = get_db()
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO subscriptions (user_id, expiry_time)
-            VALUES (%s, %s)
-            ON CONFLICT (user_id) DO UPDATE SET expiry_time = EXCLUDED.expiry_time;
-        """, (user_id, expiry))
-        conn.commit()
-        cur.close()
-        conn.close()
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO subscriptions (user_id, expiry_time)
+                VALUES (%s, %s)
+                ON CONFLICT (user_id) DO UPDATE SET expiry_time = EXCLUDED.expiry_time;
+            """, (user_id, expiry))
+            conn.commit()
     except Exception as e:
         logger.error(f"DB Error (set_user_subscription_db): {e}")
+    finally:
+        if conn:
+            conn.close()
 
 def remove_user_subscription_db(user_id: int) -> bool:
+    conn = None
     try:
         conn = get_db()
-        cur = conn.cursor()
-        cur.execute("DELETE FROM subscriptions WHERE user_id = %s;", (user_id,))
-        deleted = cur.rowcount > 0
-        conn.commit()
-        cur.close()
-        conn.close()
-        return deleted
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM subscriptions WHERE user_id = %s;", (user_id,))
+            deleted = cur.rowcount > 0
+            conn.commit()
+            return deleted
     except Exception as e:
         logger.error(f"DB Error (remove_user_subscription_db): {e}")
         return False
+    finally:
+        if conn:
+            conn.close()
 
 def get_subscription_details_db(user_id: int):
+    conn = None
     try:
         conn = get_db()
-        cur = conn.cursor()
-        cur.execute("SELECT expiry_time FROM subscriptions WHERE user_id = %s;", (user_id,))
-        row = cur.fetchone()
-        cur.close()
-        conn.close()
-        return row['expiry_time'].strftime("%Y-%m-%d %H:%M:%S") if row else None
+        with conn.cursor() as cur:
+            cur.execute("SELECT expiry_time FROM subscriptions WHERE user_id = %s;", (user_id,))
+            row = cur.fetchone()
+            return row['expiry_time'].strftime("%Y-%m-%d %H:%M:%S UTC") if row else None
     except Exception as e:
         logger.error(f"DB Error (get_subscription_details_db): {e}")
         return None
+    finally:
+        if conn:
+            conn.close()
 
 def get_stats_data_db():
+    conn = None
     try:
         conn = get_db()
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) as count FROM videos;")
-        v_count = cur.fetchone()['count']
-        cur.execute("SELECT COUNT(*) as count FROM subscriptions WHERE expiry_time > %s;", (datetime.datetime.now(),))
-        u_count = cur.fetchone()['count']
-        cur.close()
-        conn.close()
-        return v_count, u_count
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) as count FROM videos;")
+            v_count = cur.fetchone()['count']
+            cur.execute("SELECT COUNT(*) as count FROM subscriptions WHERE expiry_time > %s;", (datetime.datetime.now(datetime.timezone.utc),))
+            u_count = cur.fetchone()['count']
+            return v_count, u_count
     except Exception as e:
         logger.error(f"DB Error (get_stats_data_db): {e}")
         return 0, 0
+    finally:
+        if conn:
+            conn.close()
 
 def get_all_active_users_db():
+    conn = None
     try:
         conn = get_db()
-        cur = conn.cursor()
-        cur.execute("SELECT user_id FROM subscriptions WHERE expiry_time > %s;", (datetime.datetime.now(),))
-        users = [row['user_id'] for row in cur.fetchall()]
-        cur.close()
-        conn.close()
-        return users
+        with conn.cursor() as cur:
+            cur.execute("SELECT user_id FROM subscriptions WHERE expiry_time > %s;", (datetime.datetime.now(datetime.timezone.utc),))
+            return [row['user_id'] for row in cur.fetchall()]
     except Exception as e:
         logger.error(f"DB Error (get_all_active_users_db): {e}")
         return []
+    finally:
+        if conn:
+            conn.close()
 
 # ---------------------------------------------------------
-# KEYBOARD BUILDERS
+# 4. KEYBOARD LAYOUTS
 # ---------------------------------------------------------
 def get_main_menu_keyboard():
     return InlineKeyboardMarkup([
@@ -227,7 +251,7 @@ def get_nav_keyboard():
     ])
 
 # ---------------------------------------------------------
-# USER BOT HANDLERS
+# 5. USER HANDLERS
 # ---------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -286,13 +310,16 @@ async def open_course(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
 
     if not await asyncio.to_thread(is_user_subscribed_db, user_id):
-        await query.message.reply_text("🔒 Aapki subscription active nahi hai ya expire ho chuki hai! Pehle /start karke plan khareedein.")
+        await query.message.reply_text("🔒 Aapki subscription active nahi hai! Pehle /start karke plan khareedein.")
         return
 
     video = await asyncio.to_thread(get_random_video_db)
     if not video:
         await query.message.reply_text("📂 Database me abhi koi video available nahi hai.")
         return
+
+    context.user_data['history'] = [video['file_id']]
+    context.user_data['history_idx'] = 0
 
     await context.bot.send_video(
         chat_id=user_id,
@@ -302,18 +329,15 @@ async def open_course(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-# FAST CLICK FIX (LOCK MECHANISM)
 async def handle_navigation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
 
-    # Initialize lock for user if not exists
     if user_id not in USER_LOCKS:
         USER_LOCKS[user_id] = asyncio.Lock()
 
-    # If lock is locked, user is clicking too fast. Ignore extra clicks.
     if USER_LOCKS[user_id].locked():
-        await query.answer("⏳ Wait a second, loading video...")
+        await query.answer("⏳ Processing... please wait.")
         return
 
     async with USER_LOCKS[user_id]:
@@ -323,25 +347,55 @@ async def handle_navigation(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("🔒 Subscription Expired! Access lene ke liye /start karein.")
             return
 
-        video = await asyncio.to_thread(get_random_video_db)
+        history = context.user_data.get('history', [])
+        idx = context.user_data.get('history_idx', -1)
+        action = query.data
+
+        if action == "nav_prev":
+            if idx > 0:
+                idx -= 1
+                video = await asyncio.to_thread(get_video_by_file_id, history[idx])
+            else:
+                await query.answer("⚠️ Pehle koi video nahi hai!", show_alert=True)
+                return
+        else:  # nav_next
+            if idx < len(history) - 1:
+                idx += 1
+                video = await asyncio.to_thread(get_video_by_file_id, history[idx])
+            else:
+                video = await asyncio.to_thread(get_random_video_db)
+                if video:
+                    history.append(video['file_id'])
+                    idx += 1
+
         if not video:
-            await query.message.reply_text("⚠️ Database me koi video nahi mili.")
+            await query.message.reply_text("⚠️ Video load nahi ho paayi.")
             return
 
-        # 1. PURANI VIDEO DELETE
-        try:
-            await query.message.delete()
-        except Exception as e:
-            logger.warning(f"Failed to delete previous video: {e}")
+        context.user_data['history'] = history
+        context.user_data['history_idx'] = idx
 
-        # 2. NAYI VIDEO SEND
-        await context.bot.send_video(
-            chat_id=query.message.chat_id,
-            video=video['file_id'],
-            caption=video['caption'] or "✨ *Premium Video*",
-            reply_markup=get_nav_keyboard(),
-            parse_mode="Markdown"
-        )
+        try:
+            await query.edit_message_media(
+                media=InputMediaVideo(
+                    media=video['file_id'],
+                    caption=video['caption'] or "✨ *Premium Video*",
+                    parse_mode="Markdown"
+                ),
+                reply_markup=get_nav_keyboard()
+            )
+        except Exception:
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
+            await context.bot.send_video(
+                chat_id=query.message.chat_id,
+                video=video['file_id'],
+                caption=video['caption'] or "✨ *Premium Video*",
+                reply_markup=get_nav_keyboard(),
+                parse_mode="Markdown"
+            )
 
 async def check_status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -358,7 +412,7 @@ async def check_status_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await query.answer("❌ No active subscription found.", show_alert=True)
 
 # ---------------------------------------------------------
-# PAYMENT & MEDIA HANDLERS
+# 6. ADMIN & MEDIA HANDLERS
 # ---------------------------------------------------------
 async def handle_photo_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -435,15 +489,18 @@ async def auto_upload_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption = update.message.caption or ""
 
     def _insert():
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO videos (file_id, caption) VALUES (%s, %s) ON CONFLICT (file_id) DO NOTHING;",
-            (file_id, caption)
-        )
-        conn.commit()
-        cur.close()
-        conn.close()
+        conn = None
+        try:
+            conn = get_db()
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO videos (file_id, caption) VALUES (%s, %s) ON CONFLICT (file_id) DO NOTHING;",
+                    (file_id, caption)
+                )
+                conn.commit()
+        finally:
+            if conn:
+                conn.close()
 
     try:
         await asyncio.to_thread(_insert)
@@ -452,7 +509,7 @@ async def auto_upload_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Error saving video: `{e}`", parse_mode="Markdown")
 
 # ---------------------------------------------------------
-# ADMIN COMMANDS
+# 7. ADMIN COMMANDS
 # ---------------------------------------------------------
 async def grant_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -537,14 +594,14 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"📢 Broadcast `{sent}/{len(users)}` active users ko bhej diya gaya.", parse_mode="Markdown")
 
 # ---------------------------------------------------------
-# APPLICATION ENTRY POINT
+# 8. APPLICATION ENTRY POINT
 # ---------------------------------------------------------
 def main():
     init_db()
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # User Handlers
+    # Handlers Registration
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_buy, pattern="^buy_"))
     app.add_handler(CallbackQueryHandler(open_course, pattern="^open_course$"))
@@ -564,7 +621,7 @@ def main():
     app.add_handler(MessageHandler(filters.VIDEO, auto_upload_video))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo_received))
 
-    logger.info("Bot is active and running...")
+    logger.info("Bot is running seamlessly...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
