@@ -74,7 +74,7 @@ USER_QR_MESSAGES = {}
 USER_LOCKS = {}
 
 # ---------------------------------------------------------
-# 3. DATABASE CONNECTION & SCHEMAS (AUTO MIGRATION ENABLED)
+# 3. DATABASE CONNECTION & SCHEMAS
 # ---------------------------------------------------------
 def get_db():
     if not DATABASE_URL:
@@ -93,7 +93,7 @@ def init_db():
     try:
         conn = get_db()
         with conn.cursor() as cur:
-            # Create videos table if it doesn't exist
+            # 1. Base table creation
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS videos (
                     id SERIAL PRIMARY KEY,
@@ -102,13 +102,13 @@ def init_db():
                 );
             """)
             
-            # Safe Migration: Add caption column if missing in older schema
+            # 2. Safe Column Migration
             cur.execute("""
                 ALTER TABLE videos 
                 ADD COLUMN IF NOT EXISTS caption TEXT;
             """)
 
-            # Create subscriptions table
+            # 3. Create Subscriptions table
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS subscriptions (
                     user_id BIGINT PRIMARY KEY,
@@ -527,19 +527,25 @@ async def auto_upload_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             conn = get_db()
             with conn.cursor() as cur:
+                # 1. Check if video exists without relying on ON CONFLICT constraints
+                cur.execute("SELECT id FROM videos WHERE file_id = %s;", (file_id,))
+                if cur.fetchone():
+                    return False  # Already exists
+                
+                # 2. Insert new video
                 cur.execute(
-                    "INSERT INTO videos (file_id, caption) VALUES (%s, %s) ON CONFLICT (file_id) DO NOTHING;",
+                    "INSERT INTO videos (file_id, caption) VALUES (%s, %s);",
                     (file_id, caption)
                 )
                 conn.commit()
-                return cur.rowcount
+                return True  # Saved
         finally:
             if conn:
                 conn.close()
 
     try:
-        rows = await asyncio.to_thread(_insert)
-        if rows > 0:
+        is_saved = await asyncio.to_thread(_insert)
+        if is_saved:
             await update.message.reply_text("✅ Video Database me successfully save ho gayi!")
         else:
             await update.message.reply_text("ℹ️ Ye Video pehle se Database me save hai.")
