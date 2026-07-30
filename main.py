@@ -74,13 +74,12 @@ USER_QR_MESSAGES = {}
 USER_LOCKS = {}
 
 # ---------------------------------------------------------
-# 3. DATABASE CONNECTION (WITH SSL FOR RENDER)
+# 3. DATABASE CONNECTION & SCHEMAS (AUTO MIGRATION ENABLED)
 # ---------------------------------------------------------
 def get_db():
     if not DATABASE_URL:
-        raise ValueError("DATABASE_URL environment variable is missing!")
+        raise ValueError("DATABASE_URL environment variable missing!")
     
-    # Auto-append sslmode=require for Render / External Cloud Postgres
     if "sslmode" not in DATABASE_URL:
         connector = "&" if "?" in DATABASE_URL else "?"
         url_with_ssl = f"{DATABASE_URL}{connector}sslmode=require"
@@ -94,6 +93,7 @@ def init_db():
     try:
         conn = get_db()
         with conn.cursor() as cur:
+            # Create videos table if it doesn't exist
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS videos (
                     id SERIAL PRIMARY KEY,
@@ -101,6 +101,14 @@ def init_db():
                     caption TEXT
                 );
             """)
+            
+            # Safe Migration: Add caption column if missing in older schema
+            cur.execute("""
+                ALTER TABLE videos 
+                ADD COLUMN IF NOT EXISTS caption TEXT;
+            """)
+
+            # Create subscriptions table
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS subscriptions (
                     user_id BIGINT PRIMARY KEY,
@@ -108,7 +116,7 @@ def init_db():
                 );
             """)
             conn.commit()
-        logger.info("✅ Database initialized successfully.")
+        logger.info("✅ Database initialized & migrated successfully.")
     except Exception as e:
         logger.error(f"❌ Database Init Error: {e}")
     finally:
@@ -496,14 +504,22 @@ async def auto_upload_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
     if user_id != ADMIN_ID:
-        await update.message.reply_text(f"⚠️ Aap Admin nahi hain! Aapki User ID hai: `{user_id}`\nRender variables me ADMIN_ID yehi set karein.", parse_mode="Markdown")
+        await update.message.reply_text(
+            f"⚠️ Access Denied!\nAapki Telegram User ID: {user_id}\nBot ADMIN_ID: {ADMIN_ID}\n\n"
+            f"Render Variables me ADMIN_ID ko {user_id} set karein."
+        )
         return
 
-    video_obj = update.message.video
-    if not video_obj:
+    file_id = None
+    if update.message.video:
+        file_id = update.message.video.file_id
+    elif update.message.document and update.message.document.mime_type and update.message.document.mime_type.startswith("video/"):
+        file_id = update.message.document.file_id
+
+    if not file_id:
+        await update.message.reply_text("⚠️ Ye valid video file nahi hai.")
         return
 
-    file_id = video_obj.file_id
     caption = update.message.caption or ""
 
     def _insert():
@@ -516,15 +532,20 @@ async def auto_upload_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     (file_id, caption)
                 )
                 conn.commit()
+                return cur.rowcount
         finally:
             if conn:
                 conn.close()
 
     try:
-        await asyncio.to_thread(_insert)
-        await update.message.reply_text("✅ **Video Database me save ho gayi!**", parse_mode="Markdown")
+        rows = await asyncio.to_thread(_insert)
+        if rows > 0:
+            await update.message.reply_text("✅ Video Database me successfully save ho gayi!")
+        else:
+            await update.message.reply_text("ℹ️ Ye Video pehle se Database me save hai.")
     except Exception as e:
-        await update.message.reply_text(f"❌ Error saving video to DB: `{e}`", parse_mode="Markdown")
+        logger.error(f"Video Save DB Error: {e}")
+        await update.message.reply_text(f"❌ Database Save Error: {str(e)}")
 
 # ---------------------------------------------------------
 # 7. ADMIN COMMANDS
@@ -636,7 +657,7 @@ def main():
 
     # Media Handlers
     app.add_handler(CallbackQueryHandler(handle_approval, pattern="^(app_|rej_)"))
-    app.add_handler(MessageHandler(filters.VIDEO, auto_upload_video))
+    app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, auto_upload_video))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo_received))
 
     logger.info("Bot is running seamlessly...")
