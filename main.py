@@ -36,7 +36,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"Bot is active and running!")
 
     def log_message(self, format, *args):
-        return  # Suppress health check logs
+        return
 
 def run_health_check_server():
     port = int(os.environ.get("PORT", 8080))
@@ -60,7 +60,6 @@ logger = logging.getLogger(__name__)
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "7572036863"))
 
-# Render URL Fix: postgres:// ko postgresql:// me badalna (Crucial for Render DB)
 RAW_DATABASE_URL = os.getenv("DATABASE_URL")
 if RAW_DATABASE_URL and RAW_DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = RAW_DATABASE_URL.replace("postgres://", "postgresql://", 1)
@@ -402,6 +401,7 @@ async def render_video_message(context: ContextTypes.DEFAULT_TYPE, user_id: int,
         if filtered_title:
             clean_caption = f"🎬 **{filtered_title}**\n\n✨ *Exclusive Premium Content*"
 
+    # AGAR NAVIGATION (PREV/NEXT) SE AAYA HAI: SAME MESSAGE EDIT HOGA
     if edit_query:
         try:
             await edit_query.edit_message_media(
@@ -413,8 +413,13 @@ async def render_video_message(context: ContextTypes.DEFAULT_TYPE, user_id: int,
             await start_inactivity_timer(context, user_id)
             return
         except Exception as e:
-            logger.warning(f"Failed to edit video media: {e}")
+            logger.warning(f"Failed to edit video media directly: {e}")
+            try:
+                await edit_query.message.delete()
+            except Exception:
+                pass
 
+    # FIRST TIME YA EDIT FAIL HONE PAR SAFE SINGLE NEW VIDEO MESSAGE
     sent_msg = await context.bot.send_video(
         chat_id=user_id,
         video=file_id,
