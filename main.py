@@ -23,7 +23,7 @@ from telegram.ext import (
 )
 
 # ---------------------------------------------------------
-# 1. RENDER HEALTH CHECK SERVER
+# 1. HEALTH CHECK SERVER FOR RENDER
 # ---------------------------------------------------------
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -46,7 +46,7 @@ def run_health_check_server():
 threading.Thread(target=run_health_check_server, daemon=True).start()
 
 # ---------------------------------------------------------
-# 2. LOGGING & CONFIGURATION
+# 2. CONFIGURATION & LOGGING
 # ---------------------------------------------------------
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -56,7 +56,12 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
 RAW_DATABASE_URL = os.getenv("DATABASE_URL")
-ADMIN_ID = int(os.getenv("ADMIN_ID") or os.getenv("ADMIN_CHAT_ID", "0"))
+ADMIN_ID_RAW = os.getenv("ADMIN_ID") or os.getenv("ADMIN_CHAT_ID", "0")
+
+try:
+    ADMIN_ID = int(ADMIN_ID_RAW.strip())
+except ValueError:
+    ADMIN_ID = 0
 
 if RAW_DATABASE_URL and RAW_DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = RAW_DATABASE_URL.replace("postgres://", "postgresql://", 1)
@@ -69,10 +74,20 @@ USER_QR_MESSAGES = {}
 USER_LOCKS = {}
 
 # ---------------------------------------------------------
-# 3. DATABASE HELPER FUNCTIONS
+# 3. DATABASE CONNECTION (WITH SSL FOR RENDER)
 # ---------------------------------------------------------
 def get_db():
-    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor, connect_timeout=10)
+    if not DATABASE_URL:
+        raise ValueError("DATABASE_URL environment variable is missing!")
+    
+    # Auto-append sslmode=require for Render / External Cloud Postgres
+    if "sslmode" not in DATABASE_URL:
+        connector = "&" if "?" in DATABASE_URL else "?"
+        url_with_ssl = f"{DATABASE_URL}{connector}sslmode=require"
+    else:
+        url_with_ssl = DATABASE_URL
+        
+    return psycopg2.connect(url_with_ssl, cursor_factory=RealDictCursor, connect_timeout=10)
 
 def init_db():
     conn = None
@@ -93,9 +108,9 @@ def init_db():
                 );
             """)
             conn.commit()
-        logger.info("Database initialized successfully.")
+        logger.info("✅ Database initialized successfully.")
     except Exception as e:
-        logger.error(f"Database Init Error: {e}")
+        logger.error(f"❌ Database Init Error: {e}")
     finally:
         if conn:
             conn.close()
@@ -412,7 +427,7 @@ async def check_status_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await query.answer("❌ No active subscription found.", show_alert=True)
 
 # ---------------------------------------------------------
-# 6. ADMIN & MEDIA HANDLERS
+# 6. AUTO VIDEO SAVE & PAYMENT HANDLERS
 # ---------------------------------------------------------
 async def handle_photo_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -478,7 +493,10 @@ async def handle_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 async def auto_upload_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    user_id = update.effective_user.id
+    
+    if user_id != ADMIN_ID:
+        await update.message.reply_text(f"⚠️ Aap Admin nahi hain! Aapki User ID hai: `{user_id}`\nRender variables me ADMIN_ID yehi set karein.", parse_mode="Markdown")
         return
 
     video_obj = update.message.video
@@ -506,7 +524,7 @@ async def auto_upload_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await asyncio.to_thread(_insert)
         await update.message.reply_text("✅ **Video Database me save ho gayi!**", parse_mode="Markdown")
     except Exception as e:
-        await update.message.reply_text(f"❌ Error saving video: `{e}`", parse_mode="Markdown")
+        await update.message.reply_text(f"❌ Error saving video to DB: `{e}`", parse_mode="Markdown")
 
 # ---------------------------------------------------------
 # 7. ADMIN COMMANDS
@@ -594,7 +612,7 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"📢 Broadcast `{sent}/{len(users)}` active users ko bhej diya gaya.", parse_mode="Markdown")
 
 # ---------------------------------------------------------
-# 8. APPLICATION ENTRY POINT
+# 8. MAIN ENTRY POINT
 # ---------------------------------------------------------
 def main():
     init_db()
