@@ -56,11 +56,17 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------
 # CONFIGURATION
 # ---------------------------------------------------------
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+if not TOKEN:
+    raise ValueError("TELEGRAM_BOT_TOKEN Environment Variable missing!")
+
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "7572036863"))
 
 RAW_DATABASE_URL = os.getenv("DATABASE_URL")
-if RAW_DATABASE_URL and RAW_DATABASE_URL.startswith("postgres://"):
+if not RAW_DATABASE_URL:
+    raise ValueError("DATABASE_URL Environment Variable missing!")
+
+if RAW_DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = RAW_DATABASE_URL.replace("postgres://", "postgresql://", 1)
 else:
     DATABASE_URL = RAW_DATABASE_URL
@@ -73,16 +79,15 @@ USER_INACTIVITY_TASKS = {}
 # ---------------------------------------------------------
 # DATABASE CONNECTION POOL & SETUP
 # ---------------------------------------------------------
-db_pool = None
+db_pool: Optional[SimpleConnectionPool] = None
 
 def init_db_pool():
     global db_pool
-    if not DATABASE_URL:
-        raise ValueError("DATABASE_URL Environment Variable missing!")
-    db_pool = SimpleConnectionPool(1, 20, dsn=DATABASE_URL)
+    if db_pool is None:
+        db_pool = SimpleConnectionPool(1, 20, dsn=DATABASE_URL)
 
 def get_db_connection():
-    if not db_pool:
+    if db_pool is None:
         init_db_pool()
     return db_pool.getconn()
 
@@ -101,7 +106,7 @@ def init_db():
                 CREATE TABLE IF NOT EXISTS videos (
                     id SERIAL PRIMARY KEY,
                     title TEXT,
-                    file_id TEXT
+                    file_id TEXT NOT NULL
                 )
             """)
             cursor.execute("""
@@ -118,6 +123,10 @@ def init_db():
                 )
             """)
             conn.commit()
+            logger.info("Database initialized successfully.")
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Error in init_db: {e}")
     finally:
         release_db_connection(conn)
 
@@ -132,6 +141,8 @@ def log_user_message(user_id: int, message_id: int):
             )
             conn.commit()
     except Exception as e:
+        if conn:
+            conn.rollback()
         logger.error(f"Error logging message ID for user {user_id}: {e}")
     finally:
         if conn:
@@ -146,6 +157,10 @@ def get_and_clear_user_messages(user_id: int) -> List[int]:
             cursor.execute("DELETE FROM user_messages WHERE user_id = %s", (user_id,))
             conn.commit()
             return [r["message_id"] for r in rows]
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Error getting/clearing user messages: {e}")
+        return []
     finally:
         release_db_connection(conn)
 
@@ -156,22 +171,24 @@ def cleanup_expired_users():
         with conn.cursor() as cursor:
             cursor.execute("DELETE FROM subscriptions WHERE expiry_time <= %s", (now,))
             conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Error cleaning expired users: {e}")
     finally:
         release_db_connection(conn)
 
-# --- DIRECTED NAVIGATION VIDEO FETCHING ---
 def get_navigated_video(direction: str = "first", current_id: Optional[int] = None) -> Optional[Tuple[int, str, str]]:
-    """
-    Fetches Next, Previous, or Initial video cleanly without random overlapping.
-    """
     conn = get_db_connection()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+            cursor.execute("SELECT COUNT(*) as count FROM videos")
+            if cursor.fetchone()["count"] == 0:
+                return None
+
             row = None
             if direction == "next" and current_id is not None:
                 cursor.execute("SELECT id, title, file_id FROM videos WHERE id > %s ORDER BY id ASC LIMIT 1", (current_id,))
                 row = cursor.fetchone()
-                # If end of playlist, loop back to first video
                 if not row:
                     cursor.execute("SELECT id, title, file_id FROM videos ORDER BY id ASC LIMIT 1")
                     row = cursor.fetchone()
@@ -179,7 +196,6 @@ def get_navigated_video(direction: str = "first", current_id: Optional[int] = No
             elif direction == "prev" and current_id is not None:
                 cursor.execute("SELECT id, title, file_id FROM videos WHERE id < %s ORDER BY id DESC LIMIT 1", (current_id,))
                 row = cursor.fetchone()
-                # If start of playlist, loop back to last video
                 if not row:
                     cursor.execute("SELECT id, title, file_id FROM videos ORDER BY id DESC LIMIT 1")
                     row = cursor.fetchone()
@@ -189,6 +205,10 @@ def get_navigated_video(direction: str = "first", current_id: Optional[int] = No
                 row = cursor.fetchone()
 
             return (row["id"], row["title"], row["file_id"]) if row else None
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Error in get_navigated_video: {e}")
+        return None
     finally:
         release_db_connection(conn)
 
@@ -203,6 +223,9 @@ def set_user_subscription(user_id: int, hours: int):
                 ON CONFLICT (user_id) DO UPDATE SET expiry_time = EXCLUDED.expiry_time
             """, (user_id, expiry))
             conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Error setting subscription: {e}")
     finally:
         release_db_connection(conn)
 
@@ -214,6 +237,10 @@ def remove_user_subscription(user_id: int) -> bool:
             deleted = cursor.rowcount > 0
             conn.commit()
             return deleted
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Error removing subscription: {e}")
+        return False
     finally:
         release_db_connection(conn)
 
@@ -224,6 +251,9 @@ def get_subscription_details(user_id: int) -> Optional[str]:
             cursor.execute("SELECT expiry_time FROM subscriptions WHERE user_id = %s", (user_id,))
             row = cursor.fetchone()
             return row["expiry_time"].strftime("%Y-%m-%d %H:%M:%S") if row else None
+    except Exception as e:
+        conn.rollback()
+        return None
     finally:
         release_db_connection(conn)
 
@@ -244,6 +274,9 @@ def is_user_active(user_id: int) -> bool:
                 return False
 
             return True
+    except Exception as e:
+        conn.rollback()
+        return False
     finally:
         release_db_connection(conn)
 
@@ -254,6 +287,9 @@ def get_all_active_users() -> List[int]:
         with conn.cursor(cursor_factory=RealDictCursor) as cursor:
             cursor.execute("SELECT user_id FROM subscriptions WHERE expiry_time > %s", (now,))
             return [row["user_id"] for row in cursor.fetchall()]
+    except Exception as e:
+        conn.rollback()
+        return []
     finally:
         release_db_connection(conn)
 
@@ -267,19 +303,22 @@ def get_stats_data() -> Tuple[int, int]:
             cursor.execute("SELECT COUNT(*) as count FROM subscriptions WHERE expiry_time > %s", (now,))
             active_users = cursor.fetchone()["count"]
             return total_videos, active_users
+    except Exception as e:
+        conn.rollback()
+        return 0, 0
     finally:
         release_db_connection(conn)
 
-# Initialize Database Pool & Tables
+# Database Initialization
 try:
     init_db_pool()
     init_db()
     cleanup_expired_users()
 except Exception as err:
-    logger.error(f"Database Init Warning: {err}")
+    logger.error(f"Database Init Error: {err}")
 
 # ---------------------------------------------------------
-# INACTIVITY AUTO-CLEANUP MANAGER (5 MINS TIMER)
+# INACTIVITY AUTO-CLEANUP MANAGER
 # ---------------------------------------------------------
 async def start_inactivity_timer(context: ContextTypes.DEFAULT_TYPE, user_id: int):
     if user_id in USER_INACTIVITY_TASKS:
@@ -411,7 +450,6 @@ async def render_video_message(context: ContextTypes.DEFAULT_TYPE, user_id: int,
 
     video_id, title, file_id = video
 
-    # UPGRADED HIGH-QUALITY INTERACTIVE BUTTONS
     buttons = [
         [
             InlineKeyboardButton("◀️ Previous", callback_data=f"nav_prev_{video_id}"),
@@ -461,7 +499,7 @@ async def render_video_message(context: ContextTypes.DEFAULT_TYPE, user_id: int,
 
 async def handle_navigation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer("Loading video...")  # Instant loader feedback
+    await query.answer("Loading video...")
     user_id = query.from_user.id
 
     if not await asyncio.to_thread(is_user_active, user_id):
@@ -470,7 +508,7 @@ async def handle_navigation(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     data_parts = query.data.split("_")
-    direction = data_parts[1]  # 'prev' or 'next'
+    direction = data_parts[1]
     current_video_id = int(data_parts[2]) if len(data_parts) > 2 and data_parts[2].isdigit() else None
 
     await render_video_message(context, user_id, edit_query=query, direction=direction, current_video_id=current_video_id)
@@ -679,20 +717,43 @@ async def auto_upload_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user.id != ADMIN_CHAT_ID:
         return
 
-    file_id = update.message.video.file_id
+    video_obj = update.message.video
+    if not video_obj:
+        await update.message.reply_text("❌ Valid video file nahi mili.")
+        return
+
+    file_id = video_obj.file_id
     caption = update.message.caption or ""
 
     def _insert():
         conn = get_db_connection()
         try:
             with conn.cursor() as cursor:
-                cursor.execute("INSERT INTO videos (title, file_id) VALUES (%s, %s)", (caption, file_id))
+                cursor.execute(
+                    "INSERT INTO videos (title, file_id) VALUES (%s, %s) RETURNING id",
+                    (caption, file_id)
+                )
+                inserted_id = cursor.fetchone()[0]
                 conn.commit()
+                return inserted_id
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"Error inserting video: {e}")
+            raise e
         finally:
             release_db_connection(conn)
 
-    await asyncio.to_thread(_insert)
-    await update.message.reply_text("✅ **Video Saved to Database!**", parse_mode="Markdown")
+    try:
+        video_id = await asyncio.to_thread(_insert)
+        await update.message.reply_text(
+            f"✅ **Video Saved to Database!**\n🆔 **DB Video ID:** `{video_id}`",
+            parse_mode="Markdown"
+        )
+    except Exception as err:
+        await update.message.reply_text(
+            f"❌ **Failed to Save Video!**\nError: `{err}`",
+            parse_mode="Markdown"
+        )
 
 # ---------------------------------------------------------
 # MAIN EXECUTION
@@ -717,5 +778,5 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.VIDEO, auto_upload_video))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo_received))
 
-    logger.info("🚀 Enhanced PostgreSQL Bot is Running Smoothly!")
+    logger.info("🚀 Production Ready PostgreSQL Bot is Running!")
     app.run_polling(drop_pending_updates=True)
