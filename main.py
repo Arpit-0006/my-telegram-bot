@@ -5,14 +5,12 @@ import os
 import re
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from typing import Optional, Tuple, List
+import psycopg2
 from psycopg2.extras import RealDictCursor
-from psycopg2.pool import SimpleConnectionPool
 
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    InputMediaVideo,
     Update,
 )
 from telegram.ext import (
@@ -25,14 +23,14 @@ from telegram.ext import (
 )
 
 # ---------------------------------------------------------
-# LIGHTWEIGHT DUMMY WEB SERVER FOR RENDER HEALTH CHECK
+# RENDER HEALTH CHECK SERVER (PORT BINDING FIX)
 # ---------------------------------------------------------
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header('Content-type', 'text/html')
         self.end_headers()
-        self.wfile.write(b"Bot is active and running!")
+        self.wfile.write(b"Bot is live and running!")
 
     def log_message(self, format, *args):
         return
@@ -57,353 +55,184 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------
-# CONFIGURATION & ENVIRONMENT VARIABLES
+# ENVIRONMENT VARIABLES
 # ---------------------------------------------------------
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
-if not TOKEN:
-    raise ValueError("TELEGRAM_BOT_TOKEN or BOT_TOKEN Missing!")
-
-ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID") or os.getenv("ADMIN_ID", "7572036863"))
-
+BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
 RAW_DATABASE_URL = os.getenv("DATABASE_URL")
-if not RAW_DATABASE_URL:
-    raise ValueError("DATABASE_URL Environment Variable missing!")
+ADMIN_ID = int(os.getenv("ADMIN_ID") or os.getenv("ADMIN_CHAT_ID", "0"))
 
-if RAW_DATABASE_URL.startswith("postgres://"):
+if RAW_DATABASE_URL and RAW_DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = RAW_DATABASE_URL.replace("postgres://", "postgresql://", 1)
 else:
     DATABASE_URL = RAW_DATABASE_URL
 
-QR_FILE_ID = "AgACAgUAAxkBAAMFamo9AXr8yxJhM9AJuipowCr2a9UAAvobaxtNyVFXq59REp-3CE8BAAMCAAN5AAM9BA"
+# Default QR Code File ID
+QR_FILE_ID = os.getenv("QR_FILE_ID", "AgACAgUAAxkBAAMFamo9AXr8yxJhM9AJuipowCr2a9UAAvobaxtNyVFXq59REp-3CE8BAAMCAAN5AAM9BA")
 
 USER_QR_MESSAGES = {}
-USER_INACTIVITY_TASKS = {}
 
 # ---------------------------------------------------------
-# DATABASE CONNECTION POOL & SETUP
+# DATABASE HELPERS
 # ---------------------------------------------------------
-db_pool: Optional[SimpleConnectionPool] = None
-
-def init_db_pool():
-    global db_pool
-    if db_pool is None:
-        db_pool = SimpleConnectionPool(1, 20, dsn=DATABASE_URL)
-
-def get_db_connection():
-    if db_pool is None:
-        init_db_pool()
-    return db_pool.getconn()
-
-def release_db_connection(conn):
-    if db_pool and conn:
-        try:
-            db_pool.putconn(conn)
-        except Exception as e:
-            logger.error(f"Error releasing db conn: {e}")
+def get_db():
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
 def init_db():
-    conn = None
     try:
-        conn = get_db_connection()
-        with conn.cursor() as cursor:
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS videos (
-                    id SERIAL PRIMARY KEY,
-                    title TEXT,
-                    file_id TEXT UNIQUE NOT NULL
-                )
-            """)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS subscriptions (
-                    user_id BIGINT PRIMARY KEY,
-                    expiry_time TIMESTAMP NOT NULL
-                )
-            """)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS user_messages (
-                    user_id BIGINT,
-                    message_id BIGINT,
-                    PRIMARY KEY (user_id, message_id)
-                )
-            """)
-            conn.commit()
-            logger.info("Database initialized successfully.")
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS videos (
+                id SERIAL PRIMARY KEY,
+                file_id VARCHAR(255) UNIQUE NOT NULL,
+                caption TEXT
+            );
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                user_id BIGINT PRIMARY KEY,
+                expiry_time TIMESTAMP NOT NULL
+            );
+        """)
+        conn.commit()
+        cur.close()
+        conn.close()
+        logger.info("Database setup completed successfully.")
     except Exception as e:
-        if conn:
-            conn.rollback()
-        logger.error(f"Error in init_db: {e}")
-    finally:
-        if conn:
-            release_db_connection(conn)
+        logger.error(f"Database Init Error: {e}")
 
-def log_user_message(user_id: int, message_id: int):
-    conn = None
+def get_random_video_db():
     try:
-        conn = get_db_connection()
-        with conn.cursor() as cursor:
-            cursor.execute(
-                "INSERT INTO user_messages (user_id, message_id) VALUES (%s, %s) ON CONFLICT DO NOTHING",
-                (user_id, message_id)
-            )
-            conn.commit()
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT file_id, caption FROM videos ORDER BY RANDOM() LIMIT 1;")
+        video = cur.fetchone()
+        cur.close()
+        conn.close()
+        return video
     except Exception as e:
-        if conn:
-            conn.rollback()
-        logger.error(f"Error logging message ID for user {user_id}: {e}")
-    finally:
-        if conn:
-            release_db_connection(conn)
-
-def get_and_clear_user_messages(user_id: int) -> List[int]:
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-            cursor.execute("SELECT message_id FROM user_messages WHERE user_id = %s", (user_id,))
-            rows = cursor.fetchall()
-            cursor.execute("DELETE FROM user_messages WHERE user_id = %s", (user_id,))
-            conn.commit()
-            return [r["message_id"] for r in rows]
-    except Exception as e:
-        if conn:
-            conn.rollback()
-        logger.error(f"Error getting/clearing user messages: {e}")
-        return []
-    finally:
-        if conn:
-            release_db_connection(conn)
-
-def cleanup_expired_users():
-    now = datetime.datetime.now()
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cursor:
-            cursor.execute("DELETE FROM subscriptions WHERE expiry_time <= %s", (now,))
-            conn.commit()
-    except Exception as e:
-        if conn:
-            conn.rollback()
-        logger.error(f"Error cleaning expired users: {e}")
-    finally:
-        if conn:
-            release_db_connection(conn)
-
-# ---------------------------------------------------------
-# VIDEO FETCHING & NAVIGATION (INCLUDING RANDOM)
-# ---------------------------------------------------------
-def get_navigated_video(direction: str = "first", current_id: Optional[int] = None) -> Optional[Tuple[int, str, str]]:
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-            cursor.execute("SELECT COUNT(*) as count FROM videos")
-            if cursor.fetchone()["count"] == 0:
-                return None
-
-            row = None
-            if direction == "random":
-                cursor.execute("SELECT id, title, file_id FROM videos ORDER BY RANDOM() LIMIT 1")
-                row = cursor.fetchone()
-
-            elif direction == "next" and current_id is not None:
-                cursor.execute("SELECT id, title, file_id FROM videos WHERE id > %s ORDER BY id ASC LIMIT 1", (current_id,))
-                row = cursor.fetchone()
-                if not row:
-                    cursor.execute("SELECT id, title, file_id FROM videos ORDER BY id ASC LIMIT 1")
-                    row = cursor.fetchone()
-
-            elif direction == "prev" and current_id is not None:
-                cursor.execute("SELECT id, title, file_id FROM videos WHERE id < %s ORDER BY id DESC LIMIT 1", (current_id,))
-                row = cursor.fetchone()
-                if not row:
-                    cursor.execute("SELECT id, title, file_id FROM videos ORDER BY id DESC LIMIT 1")
-                    row = cursor.fetchone()
-
-            else:
-                cursor.execute("SELECT id, title, file_id FROM videos ORDER BY id ASC LIMIT 1")
-                row = cursor.fetchone()
-
-            return (row["id"], row["title"], row["file_id"]) if row else None
-    except Exception as e:
-        if conn:
-            conn.rollback()
-        logger.error(f"Error in get_navigated_video: {e}")
+        logger.error(f"DB Error (get_random_video_db): {e}")
         return None
-    finally:
-        if conn:
-            release_db_connection(conn)
 
-def set_user_subscription(user_id: int, hours: int):
-    expiry = datetime.datetime.now() + datetime.timedelta(hours=hours)
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cursor:
-            cursor.execute("""
-                INSERT INTO subscriptions (user_id, expiry_time)
-                VALUES (%s, %s)
-                ON CONFLICT (user_id) DO UPDATE SET expiry_time = EXCLUDED.expiry_time
-            """, (user_id, expiry))
-            conn.commit()
-    except Exception as e:
-        if conn:
-            conn.rollback()
-        logger.error(f"Error setting subscription: {e}")
-    finally:
-        if conn:
-            release_db_connection(conn)
-
-def remove_user_subscription(user_id: int) -> bool:
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cursor:
-            cursor.execute("DELETE FROM subscriptions WHERE user_id = %s", (user_id,))
-            deleted = cursor.rowcount > 0
-            conn.commit()
-            return deleted
-    except Exception as e:
-        if conn:
-            conn.rollback()
-        logger.error(f"Error removing subscription: {e}")
-        return False
-    finally:
-        if conn:
-            release_db_connection(conn)
-
-def get_subscription_details(user_id: int) -> Optional[str]:
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-            cursor.execute("SELECT expiry_time FROM subscriptions WHERE user_id = %s", (user_id,))
-            row = cursor.fetchone()
-            return row["expiry_time"].strftime("%Y-%m-%d %H:%M:%S") if row else None
-    except Exception as e:
-        if conn:
-            conn.rollback()
-        return None
-    finally:
-        if conn:
-            release_db_connection(conn)
-
-def is_user_active(user_id: int) -> bool:
-    if user_id == ADMIN_CHAT_ID:
+def is_user_subscribed_db(user_id: int) -> bool:
+    if user_id == ADMIN_ID:
         return True
-
-    conn = None
     try:
-        conn = get_db_connection()
-        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-            cursor.execute("SELECT expiry_time FROM subscriptions WHERE user_id = %s", (user_id,))
-            row = cursor.fetchone()
-
-            if not row:
-                return False
-
-            expiry_time = row["expiry_time"]
-            if datetime.datetime.now() >= expiry_time:
-                cursor.execute("DELETE FROM subscriptions WHERE user_id = %s", (user_id,))
-                conn.commit()
-                return False
-
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT expiry_time FROM subscriptions WHERE user_id = %s;", (user_id,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        if row and row['expiry_time'] > datetime.datetime.now():
             return True
-    except Exception as e:
-        if conn:
-            conn.rollback()
         return False
-    finally:
-        if conn:
-            release_db_connection(conn)
-
-def get_all_active_users() -> List[int]:
-    now = datetime.datetime.now()
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-            cursor.execute("SELECT user_id FROM subscriptions WHERE expiry_time > %s", (now,))
-            return [row["user_id"] for row in cursor.fetchall()]
     except Exception as e:
-        if conn:
-            conn.rollback()
-        return []
-    finally:
-        if conn:
-            release_db_connection(conn)
+        logger.error(f"DB Error (is_user_subscribed_db): {e}")
+        return False
 
-def get_stats_data() -> Tuple[int, int]:
-    now = datetime.datetime.now()
-    conn = None
+def set_user_subscription_db(user_id: int, hours: int):
+    expiry = datetime.datetime.now() + datetime.timedelta(hours=hours)
     try:
-        conn = get_db_connection()
-        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-            cursor.execute("SELECT COUNT(*) as count FROM videos")
-            total_videos = cursor.fetchone()["count"]
-            cursor.execute("SELECT COUNT(*) as count FROM subscriptions WHERE expiry_time > %s", (now,))
-            active_users = cursor.fetchone()["count"]
-            return total_videos, active_users
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO subscriptions (user_id, expiry_time)
+            VALUES (%s, %s)
+            ON CONFLICT (user_id) DO UPDATE SET expiry_time = EXCLUDED.expiry_time;
+        """, (user_id, expiry))
+        conn.commit()
+        cur.close()
+        conn.close()
     except Exception as e:
-        if conn:
-            conn.rollback()
+        logger.error(f"DB Error (set_user_subscription_db): {e}")
+
+def remove_user_subscription_db(user_id: int) -> bool:
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM subscriptions WHERE user_id = %s;", (user_id,))
+        deleted = cur.rowcount > 0
+        conn.commit()
+        cur.close()
+        conn.close()
+        return deleted
+    except Exception as e:
+        logger.error(f"DB Error (remove_user_subscription_db): {e}")
+        return False
+
+def get_subscription_details_db(user_id: int):
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT expiry_time FROM subscriptions WHERE user_id = %s;", (user_id,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        return row['expiry_time'].strftime("%Y-%m-%d %H:%M:%S") if row else None
+    except Exception as e:
+        logger.error(f"DB Error (get_subscription_details_db): {e}")
+        return None
+
+def get_stats_data_db():
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) as count FROM videos;")
+        v_count = cur.fetchone()['count']
+        cur.execute("SELECT COUNT(*) as count FROM subscriptions WHERE expiry_time > %s;", (datetime.datetime.now(),))
+        u_count = cur.fetchone()['count']
+        cur.close()
+        conn.close()
+        return v_count, u_count
+    except Exception as e:
+        logger.error(f"DB Error (get_stats_data_db): {e}")
         return 0, 0
-    finally:
-        if conn:
-            release_db_connection(conn)
 
-# Initialize DB on Startup
-try:
-    init_db_pool()
-    init_db()
-    cleanup_expired_users()
-except Exception as err:
-    logger.error(f"Database Init Error: {err}")
-
-# ---------------------------------------------------------
-# INACTIVITY AUTO-CLEANUP MANAGER
-# ---------------------------------------------------------
-async def start_inactivity_timer(context: ContextTypes.DEFAULT_TYPE, user_id: int):
-    if user_id in USER_INACTIVITY_TASKS:
-        USER_INACTIVITY_TASKS[user_id].cancel()
-
-    async def _inactivity_job():
-        try:
-            await asyncio.sleep(300)
-            msg_ids = await asyncio.to_thread(get_and_clear_user_messages, user_id)
-            for m_id in msg_ids:
-                try:
-                    await context.bot.delete_message(chat_id=user_id, message_id=m_id)
-                except Exception:
-                    pass
-
-            if await asyncio.to_thread(is_user_active, user_id):
-                reset_msg = await context.bot.send_message(
-                    chat_id=user_id,
-                    text="⏳ **Session expired due to inactivity.**\n\nMain menu par jaane ke liye /start dabayein.",
-                    parse_mode="Markdown",
-                )
-                await asyncio.to_thread(log_user_message, user_id, reset_msg.message_id)
-
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.error(f"Inactivity timer exception: {e}")
-        finally:
-            USER_INACTIVITY_TASKS.pop(user_id, None)
-
-    task = asyncio.create_task(_inactivity_job())
-    USER_INACTIVITY_TASKS[user_id] = task
+def get_all_active_users_db():
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT user_id FROM subscriptions WHERE expiry_time > %s;", (datetime.datetime.now(),))
+        users = [row['user_id'] for row in cur.fetchall()]
+        cur.close()
+        conn.close()
+        return users
+    except Exception as e:
+        logger.error(f"DB Error (get_all_active_users_db): {e}")
+        return []
 
 # ---------------------------------------------------------
-# USER BOT FUNCTIONS
+# KEYBOARD BUILDERS
+# ---------------------------------------------------------
+def get_main_menu_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💎 Buy 24 Hours Access (₹10)", callback_data="buy_24h")],
+        [InlineKeyboardButton("🌟 Buy 7 Days Access (₹50)", callback_data="buy_7d")],
+        [InlineKeyboardButton("👑 Buy 30 Days Access (₹150)", callback_data="buy_30d")],
+        [InlineKeyboardButton("▶️ Open Purchased Content", callback_data="open_course")],
+        [InlineKeyboardButton("📊 Check Subscription Status", callback_data="check_status")]
+    ])
+
+def get_nav_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("◀️ Previous", callback_data="nav_prev"),
+            InlineKeyboardButton("Next ▶️", callback_data="nav_next")
+        ],
+        [
+            InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")
+        ]
+    ])
+
+# ---------------------------------------------------------
+# USER BOT HANDLERS
 # ---------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-
-    menu_text = (
+    welcome_text = (
         f"👋 **Namaste {user.first_name}! Welcome to Premium Video Store.**\n\n"
-        "📜 **OUR PRICING PACKAGES:**\n"
+        "📜 **PRICING PACKAGES:**\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
         "🥉 **Basic Pass:** ₹10 ➔ 24 Hours Access\n"
         "🥈 **Weekly Pass:** ₹50 ➔ 7 Days Access\n"
@@ -412,38 +241,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👇 Choose an option below:"
     )
 
-    keyboard = [
-        [InlineKeyboardButton("💎 Buy 24 Hours Access (₹10)", callback_data="buy_24h")],
-        [InlineKeyboardButton("🌟 Buy 7 Days Access (₹50)", callback_data="buy_7d")],
-        [InlineKeyboardButton("👑 Buy 30 Days Access (₹150)", callback_data="buy_30d")],
-        [InlineKeyboardButton("▶️ Open Purchased Course", callback_data="open_course")],
-        [InlineKeyboardButton("🎲 Get Random Video", callback_data="nav_random_0")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
     if update.callback_query:
         query = update.callback_query
         await query.answer()
-        sent_msg = await query.message.reply_text(
-            menu_text, reply_markup=reply_markup, parse_mode="Markdown"
-        )
+        await query.message.reply_text(welcome_text, reply_markup=get_main_menu_keyboard(), parse_mode="Markdown")
     else:
-        sent_msg = await update.message.reply_text(
-            menu_text, reply_markup=reply_markup, parse_mode="Markdown"
-        )
-
-    await asyncio.to_thread(log_user_message, user.id, sent_msg.message_id)
+        await update.message.reply_text(welcome_text, reply_markup=get_main_menu_keyboard(), parse_mode="Markdown")
 
 async def handle_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
+    
     plan = query.data
-    price, duration = "", ""
-
-    if plan == "buy_24h":
-        price, duration = "₹10", "24 Hours"
-    elif plan == "buy_7d":
+    price, duration = "₹10", "24 Hours"
+    if plan == "buy_7d":
         price, duration = "₹50", "7 Days"
     elif plan == "buy_30d":
         price, duration = "₹150", "30 Days"
@@ -451,247 +262,87 @@ async def handle_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     payment_text = (
         f"💳 **PAYMENT DETAILS ({duration} Plan)**\n\n"
         f"💵 **Amount to Pay:** {price}\n\n"
-        "📍 **Payment Process:**\n"
-        "1. Upar diye gaye QR Code ko scan karke pay karein.\n"
-        "2. Payment ka **Screenshot DIRECT Bot chat me bhejey**.\n\n"
-        "⚡ Screenshot bhejte hi humari team verify karke aapka access active kar degi!"
+        "📍 **Payment Steps:**\n"
+        "1. Scan the QR Code below and make payment.\n"
+        "2. Send the payment **Screenshot directly to this chat**.\n\n"
+        "⚡ Instant access will be granted after verification."
     )
-
-    keyboard = [[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="main_menu")]]
-
+    
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="main_menu")]])
+    
     sent_msg = await context.bot.send_photo(
         chat_id=query.from_user.id,
         photo=QR_FILE_ID,
         caption=payment_text,
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
     )
     USER_QR_MESSAGES[query.from_user.id] = sent_msg.message_id
-    await asyncio.to_thread(log_user_message, query.from_user.id, sent_msg.message_id)
 
 async def open_course(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
 
-    if not await asyncio.to_thread(is_user_active, user_id):
-        msg = await query.message.reply_text(
-            "❌ Aapke paas koi active access nahi hai ya time limit KHATAM ho gaya hai! Pehle /start dabakar plan buy karein."
-        )
-        await asyncio.to_thread(log_user_message, user_id, msg.message_id)
+    if not await asyncio.to_thread(is_user_subscribed_db, user_id):
+        await query.message.reply_text("🔒 Aapki subscription active nahi hai ya expire ho chuki hai! Pehle /start karke plan khareedein.")
         return
 
-    await render_video_message(context, user_id, edit_query=None, direction="first")
-
-async def render_video_message(context: ContextTypes.DEFAULT_TYPE, user_id: int, edit_query=None, direction: str = "first", current_video_id: Optional[int] = None):
-    video = await asyncio.to_thread(get_navigated_video, direction, current_video_id)
+    video = await asyncio.to_thread(get_random_video_db)
     if not video:
-        msg_text = "⚠️ Course me abhi koi video uploaded nahi hai."
-        if edit_query:
-            sent_msg = await edit_query.message.reply_text(msg_text)
-        else:
-            sent_msg = await context.bot.send_message(user_id, msg_text)
-        await asyncio.to_thread(log_user_message, user_id, sent_msg.message_id)
+        await query.message.reply_text("📂 Database me abhi koi video available nahi hai.")
         return
 
-    video_id, title, file_id = video
-
-    buttons = [
-        [
-            InlineKeyboardButton("◀️ Previous", callback_data=f"nav_prev_{video_id}"),
-            InlineKeyboardButton("🎲 Random", callback_data=f"nav_random_{video_id}"),
-            InlineKeyboardButton("Next ▶️", callback_data=f"nav_next_{video_id}"),
-        ],
-        [
-            InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu"),
-            InlineKeyboardButton("📊 Access Status", callback_data="check_status"),
-        ]
-    ]
-    reply_markup = InlineKeyboardMarkup(buttons)
-
-    clean_caption = "🎬 *Exclusive Premium Content*"
-    if title:
-        filtered_title = re.sub(r'(?i)(video\s*|index\s*|ep\s*|episode\s*)?part\s*[-_:]?\s*\d+', '', title).strip()
-        filtered_title = re.sub(r'(?i)^(video|index|part)\s*[-_:]?\s*\d+', '', filtered_title).strip()
-        if filtered_title:
-            clean_caption = f"🎬 **{filtered_title}**\n\n✨ *Exclusive Premium Content*"
-
-    if edit_query:
-        try:
-            await edit_query.edit_message_media(
-                media=InputMediaVideo(
-                    media=file_id, caption=clean_caption, parse_mode="Markdown"
-                ),
-                reply_markup=reply_markup,
-            )
-            await start_inactivity_timer(context, user_id)
-            return
-        except Exception as e:
-            logger.warning(f"Failed to edit video media directly: {e}")
-            try:
-                await edit_query.message.delete()
-            except Exception:
-                pass
-
-    sent_msg = await context.bot.send_video(
+    await context.bot.send_video(
         chat_id=user_id,
-        video=file_id,
-        caption=clean_caption,
-        reply_markup=reply_markup,
-        parse_mode="Markdown",
-        protect_content=True,
+        video=video['file_id'],
+        caption=video['caption'] or "✨ *Premium Video*",
+        reply_markup=get_nav_keyboard(),
+        parse_mode="Markdown"
     )
-    await asyncio.to_thread(log_user_message, user_id, sent_msg.message_id)
-    await start_inactivity_timer(context, user_id)
 
 async def handle_navigation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer("Loading video...")
+    await query.answer()
     user_id = query.from_user.id
 
-    if not await asyncio.to_thread(is_user_active, user_id):
-        msg = await query.message.reply_text("⌛ Access Expired! Naya plan khareedne ke liye /start karein.")
-        await asyncio.to_thread(log_user_message, user_id, msg.message_id)
+    if not await asyncio.to_thread(is_user_subscribed_db, user_id):
+        await query.message.reply_text("🔒 Subscription Expired! Access lene ke liye /start karein.")
         return
 
-    data_parts = query.data.split("_")
-    direction = data_parts[1]
-    current_video_id = int(data_parts[2]) if len(data_parts) > 2 and data_parts[2].isdigit() else None
+    video = await asyncio.to_thread(get_random_video_db)
+    if not video:
+        await query.message.reply_text("⚠️ Database me koi video nahi mili.")
+        return
 
-    await render_video_message(context, user_id, edit_query=query, direction=direction, current_video_id=current_video_id)
+    # Delete previous video message (Chat me hamesha sirf 1 video rahegi)
+    try:
+        await query.message.delete()
+    except Exception as e:
+        logger.warning(f"Failed to delete previous video: {e}")
+
+    # Send new random video
+    await context.bot.send_video(
+        chat_id=query.message.chat_id,
+        video=video['file_id'],
+        caption=video['caption'] or "✨ *Premium Video*",
+        reply_markup=get_nav_keyboard(),
+        parse_mode="Markdown"
+    )
 
 async def check_status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
 
-    if user_id == ADMIN_CHAT_ID:
-        await query.answer("👑 Admin Account: Unlimited Access Active!", show_alert=True)
+    if user_id == ADMIN_ID:
+        await query.answer("👑 Admin Account: Unlimited Lifetime Access!", show_alert=True)
         return
 
-    expiry = await asyncio.to_thread(get_subscription_details, user_id)
+    expiry = await asyncio.to_thread(get_subscription_details_db, user_id)
     if expiry:
-        await query.answer(f"✅ Your Access Expiry:\n{expiry}", show_alert=True)
+        await query.answer(f"✅ Access Active Until:\n{expiry}", show_alert=True)
     else:
-        await query.answer("❌ No active access plan found.", show_alert=True)
-
-# ---------------------------------------------------------
-# ADMIN COMMANDS
-# ---------------------------------------------------------
-async def grant_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_CHAT_ID:
-        return
-
-    try:
-        target_id = int(context.args[0])
-        hours = int(context.args[1])
-        await asyncio.to_thread(set_user_subscription, target_id, hours)
-        await update.message.reply_text(f"✅ Success! User `{target_id}` ko {hours} Hours ka access diya gaya.", parse_mode="Markdown")
-
-        msg = await context.bot.send_message(
-            target_id,
-            f"🎉 **Payment Verified!** Aapko {hours} Ghante ka access mil gaya hai. /start dabayein!",
-            parse_mode="Markdown"
-        )
-        await asyncio.to_thread(log_user_message, target_id, msg.message_id)
-    except Exception:
-        await update.message.reply_text("❌ Format: `/grant <USER_ID> <HOURS>`", parse_mode="Markdown")
-
-async def revoke_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_CHAT_ID:
-        return
-
-    try:
-        target_id = int(context.args[0])
-        removed = await asyncio.to_thread(remove_user_subscription, target_id)
-
-        if removed:
-            await update.message.reply_text(
-                f"🔴 **Access Cancelled!** User `{target_id}` ka access revoke kar diya gaya hai.",
-                parse_mode="Markdown",
-            )
-
-            if target_id in USER_INACTIVITY_TASKS:
-                USER_INACTIVITY_TASKS[target_id].cancel()
-
-            msg_ids = await asyncio.to_thread(get_and_clear_user_messages, target_id)
-            for m_id in msg_ids:
-                try:
-                    await context.bot.delete_message(chat_id=target_id, message_id=m_id)
-                except Exception:
-                    pass
-
-            await context.bot.send_message(
-                chat_id=target_id,
-                text="⚠️ **Notice:** Aapka course access Admin dwara Cancel kar diya gaya hai.",
-                parse_mode="Markdown"
-            )
-        else:
-            await update.message.reply_text(f"⚠️ User `{target_id}` ka koi active access nahi mila.", parse_mode="Markdown")
-
-    except Exception:
-        await update.message.reply_text("❌ Format: `/revoke <USER_ID>`", parse_mode="Markdown")
-
-async def userinfo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_CHAT_ID:
-        return
-
-    try:
-        target_id = int(context.args[0])
-        expiry = await asyncio.to_thread(get_subscription_details, target_id)
-
-        if expiry:
-            active = await asyncio.to_thread(is_user_active, target_id)
-            status = "🟢 ACTIVE" if active else "🔴 EXPIRED"
-            await update.message.reply_text(
-                f"👤 **User Info (`{target_id}`):**\n• Status: {status}\n• Expiry Date/Time: `{expiry}`",
-                parse_mode="Markdown",
-            )
-        else:
-            await update.message.reply_text(f"❌ User `{target_id}` ke paas koi active subscription record nahi hai.", parse_mode="Markdown")
-
-    except Exception:
-        await update.message.reply_text("❌ Format: `/userinfo <USER_ID>`", parse_mode="Markdown")
-
-async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_CHAT_ID:
-        return
-
-    total_videos, active_users = await asyncio.to_thread(get_stats_data)
-    stats_msg = (
-        "📊 **ADMIN BOT DASHBOARD**\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🎬 **Total Videos in DB:** {total_videos}\n"
-        f"👑 **Active Subscribers:** {active_users}\n"
-        "━━━━━━━━━━━━━━━━━━━━━"
-    )
-    await update.message.reply_text(stats_msg, parse_mode="Markdown")
-
-async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_CHAT_ID:
-        return
-
-    if not context.args:
-        await update.message.reply_text("❌ Usage: `/broadcast <Aapka Message>`", parse_mode="Markdown")
-        return
-
-    broadcast_message = " ".join(context.args)
-    active_users = await asyncio.to_thread(get_all_active_users)
-
-    sent_count = 0
-    for uid in active_users:
-        try:
-            msg = await context.bot.send_message(
-                chat_id=uid,
-                text=f"📢 **ADMIN ANNOUNCEMENT:**\n\n{broadcast_message}",
-                parse_mode="Markdown"
-            )
-            await asyncio.to_thread(log_user_message, uid, msg.message_id)
-            sent_count += 1
-            await asyncio.sleep(0.05)
-        except Exception as e:
-            logger.warning(f"Could not send broadcast to {uid}: {e}")
-
-    await update.message.reply_text(f"📢 **Broadcast Sent!** Delivered to `{sent_count}/{len(active_users)}` active users.", parse_mode="Markdown")
+        await query.answer("❌ No active subscription found.", show_alert=True)
 
 # ---------------------------------------------------------
 # PAYMENT & MEDIA HANDLERS
@@ -700,35 +351,34 @@ async def handle_photo_received(update: Update, context: ContextTypes.DEFAULT_TY
     user = update.effective_user
     photo_file_id = update.message.photo[-1].file_id
 
-    if user.id == ADMIN_CHAT_ID:
+    if user.id == ADMIN_ID:
         await update.message.reply_text(f"🖼️ **QR Code File ID:**\n\n`{photo_file_id}`", parse_mode="Markdown")
         return
 
     admin_markup = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("✅ Approve (24 Hours)", callback_data=f"app_{user.id}_24"),
-            InlineKeyboardButton("✅ Approve (7 Days)", callback_data=f"app_{user.id}_168"),
+            InlineKeyboardButton("✅ Approve (24h)", callback_data=f"app_{user.id}_24"),
+            InlineKeyboardButton("✅ Approve (7d)", callback_data=f"app_{user.id}_168"),
         ],
-        [InlineKeyboardButton("✅ Approve (30 Days)", callback_data=f"app_{user.id}_720")],
+        [InlineKeyboardButton("✅ Approve (30d)", callback_data=f"app_{user.id}_720")],
         [InlineKeyboardButton("❌ Reject Payment", callback_data=f"rej_{user.id}")],
     ])
 
     await context.bot.send_photo(
-        chat_id=ADMIN_CHAT_ID,
+        chat_id=ADMIN_ID,
         photo=photo_file_id,
         caption=f"📥 **NEW PAYMENT SCREENSHOT!**\n\n👤 **User:** {user.first_name}\n🆔 **User ID:** `{user.id}`",
         reply_markup=admin_markup,
         parse_mode="Markdown",
     )
 
-    msg = await update.message.reply_text("✅ **Screenshot Received!** Admin verification ke baad aapka access start kar diya jayega.")
-    await asyncio.to_thread(log_user_message, user.id, msg.message_id)
+    await update.message.reply_text("✅ **Screenshot Received!** Admin verification ke baad aapka access active ho jayega.")
 
 async def handle_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    if query.from_user.id != ADMIN_CHAT_ID:
+    if query.from_user.id != ADMIN_ID:
         return
 
     data = query.data.split("_")
@@ -738,83 +388,150 @@ async def handle_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             msg_id = USER_QR_MESSAGES.pop(target_user_id)
             await context.bot.delete_message(chat_id=target_user_id, message_id=msg_id)
-        except Exception as e:
-            logger.warning(f"Could not delete QR message for user {target_user_id}: {e}")
+        except Exception:
+            pass
 
     if action == "app":
         hours = int(data[2])
-        await asyncio.to_thread(set_user_subscription, target_user_id, hours)
+        await asyncio.to_thread(set_user_subscription_db, target_user_id, hours)
         await query.edit_message_caption(caption=f"✅ **APPROVED:** User `{target_user_id}` ko {hours} Hours ka access de diya.", parse_mode="Markdown")
 
-        msg = await context.bot.send_message(
+        await context.bot.send_message(
             chat_id=target_user_id,
             text=f"🎉 **Payment Verified!** Aapko **{hours} Ghante** ka access mil gaya hai. /start dabakar Open Course par click karein!",
             parse_mode="Markdown"
         )
-        await asyncio.to_thread(log_user_message, target_user_id, msg.message_id)
-
     elif action == "rej":
-        await query.edit_message_caption(caption=f"❌ **REJECTED:** User `{target_user_id}` ka payment reject hua.", parse_mode="Markdown")
+        await query.edit_message_caption(caption=f"❌ **REJECTED:** User `{target_user_id}` ka payment reject kiya gaya.", parse_mode="Markdown")
 
-        msg = await context.bot.send_message(
+        await context.bot.send_message(
             chat_id=target_user_id,
-            text="❌ **Payment Verification Failed!** Please send valid screenshot.",
+            text="❌ **Payment Verification Failed!** Please send valid payment screenshot.",
             parse_mode="Markdown"
         )
-        await asyncio.to_thread(log_user_message, target_user_id, msg.message_id)
 
 async def auto_upload_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if user.id != ADMIN_CHAT_ID:
+    if update.effective_user.id != ADMIN_ID:
         return
 
     video_obj = update.message.video
     if not video_obj:
-        await update.message.reply_text("❌ Valid video file nahi mili.")
         return
 
     file_id = video_obj.file_id
     caption = update.message.caption or ""
 
     def _insert():
-        conn = None
-        try:
-            conn = get_db_connection()
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    "INSERT INTO videos (title, file_id) VALUES (%s, %s) ON CONFLICT (file_id) DO NOTHING RETURNING id",
-                    (caption, file_id)
-                )
-                row = cursor.fetchone()
-                conn.commit()
-                return row[0] if row else "Already Exists"
-        except Exception as e:
-            if conn:
-                conn.rollback()
-            logger.error(f"Error inserting video: {e}")
-            raise e
-        finally:
-            if conn:
-                release_db_connection(conn)
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO videos (file_id, caption) VALUES (%s, %s) ON CONFLICT (file_id) DO NOTHING;",
+            (file_id, caption)
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
 
     try:
-        video_id = await asyncio.to_thread(_insert)
-        await update.message.reply_text(
-            f"✅ **Video Saved to Database!**\n🆔 **DB Status/ID:** `{video_id}`",
-            parse_mode="Markdown"
-        )
-    except Exception as err:
-        await update.message.reply_text(
-            f"❌ **Failed to Save Video!**\nError: `{err}`",
-            parse_mode="Markdown"
-        )
+        await asyncio.to_thread(_insert)
+        await update.message.reply_text("✅ **Video Database me save ho gayi!**", parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error saving video: `{e}`", parse_mode="Markdown")
 
 # ---------------------------------------------------------
-# MAIN EXECUTION
+# ADMIN COMMANDS
 # ---------------------------------------------------------
-if __name__ == "__main__":
-    app = ApplicationBuilder().token(TOKEN).build()
+async def grant_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
 
+    try:
+        target_id = int(context.args[0])
+        hours = int(context.args[1])
+        await asyncio.to_thread(set_user_subscription_db, target_id, hours)
+        await update.message.reply_text(f"✅ User `{target_id}` ko {hours} Hours ka access de diya gaya hai.", parse_mode="Markdown")
+        await context.bot.send_message(
+            target_id,
+            f"🎉 **Access Granted!** Admin ne aapko {hours} Hours ka access de diya hai. /start karein!",
+            parse_mode="Markdown"
+        )
+    except Exception:
+        await update.message.reply_text("⚠️ Format: `/grant <USER_ID> <HOURS>`", parse_mode="Markdown")
+
+async def revoke_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    try:
+        target_id = int(context.args[0])
+        removed = await asyncio.to_thread(remove_user_subscription_db, target_id)
+        if removed:
+            await update.message.reply_text(f"🔴 User `{target_id}` ka access revoke kar diya gaya hai.", parse_mode="Markdown")
+            await context.bot.send_message(target_id, "⚠️ Aapka course access Revoke kar diya gaya hai.", parse_mode="Markdown")
+        else:
+            await update.message.reply_text(f"⚠️ User `{target_id}` active nahi mila.", parse_mode="Markdown")
+    except Exception:
+        await update.message.reply_text("⚠️ Format: `/revoke <USER_ID>`", parse_mode="Markdown")
+
+async def userinfo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    try:
+        target_id = int(context.args[0])
+        expiry = await asyncio.to_thread(get_subscription_details_db, target_id)
+        if expiry:
+            await update.message.reply_text(f"👤 **User ID:** `{target_id}`\n⏳ **Expiry Date:** `{expiry}`", parse_mode="Markdown")
+        else:
+            await update.message.reply_text(f"❌ User `{target_id}` ki koi subscription record nahi mili.", parse_mode="Markdown")
+    except Exception:
+        await update.message.reply_text("⚠️ Format: `/userinfo <USER_ID>`", parse_mode="Markdown")
+
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    v_count, u_count = await asyncio.to_thread(get_stats_data_db)
+    msg = (
+        "📊 **BOT DASHBOARD STATS**\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🎬 **Total Videos in DB:** {v_count}\n"
+        f"👥 **Active Subscribers:** {u_count}\n"
+        "━━━━━━━━━━━━━━━━━━━━━"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    if not context.args:
+        await update.message.reply_text("⚠️ Format: `/broadcast <Aapka Message>`", parse_mode="Markdown")
+        return
+
+    broadcast_msg = " ".join(context.args)
+    users = await asyncio.to_thread(get_all_active_users_db)
+
+    sent = 0
+    for uid in users:
+        try:
+            await context.bot.send_message(uid, f"📢 **ANNOUNCEMENT:**\n\n{broadcast_msg}", parse_mode="Markdown")
+            sent += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            pass
+
+    await update.message.reply_text(f"📢 Broadcast `{sent}/{len(users)}` active users ko bhej diya gaya.", parse_mode="Markdown")
+
+# ---------------------------------------------------------
+# APPLICATION ENTRY POINT
+# ---------------------------------------------------------
+def main():
+    init_db()
+
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    # User Command Handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_buy, pattern="^buy_"))
     app.add_handler(CallbackQueryHandler(open_course, pattern="^open_course$"))
@@ -822,15 +539,20 @@ if __name__ == "__main__":
     app.add_handler(CallbackQueryHandler(handle_navigation, pattern="^nav_"))
     app.add_handler(CallbackQueryHandler(check_status_callback, pattern="^check_status$"))
 
+    # Admin Command Handlers
     app.add_handler(CommandHandler("grant", grant_cmd))
     app.add_handler(CommandHandler("revoke", revoke_cmd))
     app.add_handler(CommandHandler("userinfo", userinfo_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
 
+    # Media & Approval Handlers
     app.add_handler(CallbackQueryHandler(handle_approval, pattern="^(app_|rej_)"))
     app.add_handler(MessageHandler(filters.VIDEO, auto_upload_video))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo_received))
 
-    logger.info("🚀 Bot started successfully with Polling mode!")
+    logger.info("Bot is active and polling...")
     app.run_polling(drop_pending_updates=True)
+
+if __name__ == "__main__":
+    main()
