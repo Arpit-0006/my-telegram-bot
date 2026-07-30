@@ -8,6 +8,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from psycopg2.pool import SimpleConnectionPool
 
 from telegram import (
     InlineKeyboardButton,
@@ -34,6 +35,9 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"Bot is active and running!")
 
+    def log_message(self, format, *args):
+        return  # Suppress health check logs
+
 def run_health_check_server():
     port = int(os.environ.get("PORT", 8080))
     server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
@@ -55,7 +59,13 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "7572036863"))
-DATABASE_URL = os.getenv("DATABASE_URL")  # Render Database Connection Link
+
+# Render URL Fix: postgres:// ko postgresql:// me badalna (Crucial for Render DB)
+RAW_DATABASE_URL = os.getenv("DATABASE_URL")
+if RAW_DATABASE_URL and RAW_DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = RAW_DATABASE_URL.replace("postgres://", "postgresql://", 1)
+else:
+    DATABASE_URL = RAW_DATABASE_URL
 
 QR_FILE_ID = "AgACAgUAAxkBAAMFamo9AXr8yxJhM9AJuipowCr2a9UAAvobaxtNyVFXq59REp-3CE8BAAMCAAN5AAM9BA"
 
@@ -63,16 +73,28 @@ USER_QR_MESSAGES = {}
 USER_INACTIVITY_TASKS = {}
 
 # ---------------------------------------------------------
-# DATABASE HELPER & SETUP (PostgreSQL)
+# DATABASE CONNECTION POOL & SETUP
 # ---------------------------------------------------------
-def get_db_connection():
+db_pool = None
+
+def init_db_pool():
+    global db_pool
     if not DATABASE_URL:
         raise ValueError("DATABASE_URL Environment Variable missing!")
-    conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
-    return conn
+    db_pool = SimpleConnectionPool(1, 20, dsn=DATABASE_URL)
+
+def get_db_connection():
+    if not db_pool:
+        init_db_pool()
+    return db_pool.getconn()
+
+def release_db_connection(conn):
+    if db_pool and conn:
+        db_pool.putconn(conn)
 
 def init_db():
-    with get_db_connection() as conn:
+    conn = get_db_connection()
+    try:
         with conn.cursor() as cursor:
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS videos (
@@ -95,45 +117,61 @@ def init_db():
                 )
             """)
             conn.commit()
+    finally:
+        release_db_connection(conn)
 
 def log_user_message(user_id: int, message_id: int):
+    conn = None
     try:
-        with get_db_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    "INSERT INTO user_messages (user_id, message_id) VALUES (%s, %s) ON CONFLICT DO NOTHING",
-                    (user_id, message_id)
-                )
-                conn.commit()
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO user_messages (user_id, message_id) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                (user_id, message_id)
+            )
+            conn.commit()
     except Exception as e:
         logger.error(f"Error logging message ID for user {user_id}: {e}")
+    finally:
+        if conn:
+            release_db_connection(conn)
 
 def get_and_clear_user_messages(user_id: int) -> List[int]:
-    with get_db_connection() as conn:
-        with conn.cursor() as cursor:
+    conn = get_db_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
             cursor.execute("SELECT message_id FROM user_messages WHERE user_id = %s", (user_id,))
             rows = cursor.fetchall()
             cursor.execute("DELETE FROM user_messages WHERE user_id = %s", (user_id,))
             conn.commit()
-    return [r["message_id"] for r in rows]
+            return [r["message_id"] for r in rows]
+    finally:
+        release_db_connection(conn)
 
 def cleanup_expired_users():
     now = datetime.datetime.now()
-    with get_db_connection() as conn:
+    conn = get_db_connection()
+    try:
         with conn.cursor() as cursor:
             cursor.execute("DELETE FROM subscriptions WHERE expiry_time <= %s", (now,))
             conn.commit()
+    finally:
+        release_db_connection(conn)
 
 def get_random_video() -> Optional[Tuple[int, str, str]]:
-    with get_db_connection() as conn:
-        with conn.cursor() as cursor:
+    conn = get_db_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
             cursor.execute("SELECT id, title, file_id FROM videos ORDER BY RANDOM() LIMIT 1")
             row = cursor.fetchone()
             return (row["id"], row["title"], row["file_id"]) if row else None
+    finally:
+        release_db_connection(conn)
 
 def set_user_subscription(user_id: int, hours: int):
     expiry = datetime.datetime.now() + datetime.timedelta(hours=hours)
-    with get_db_connection() as conn:
+    conn = get_db_connection()
+    try:
         with conn.cursor() as cursor:
             cursor.execute("""
                 INSERT INTO subscriptions (user_id, expiry_time)
@@ -141,25 +179,34 @@ def set_user_subscription(user_id: int, hours: int):
                 ON CONFLICT (user_id) DO UPDATE SET expiry_time = EXCLUDED.expiry_time
             """, (user_id, expiry))
             conn.commit()
+    finally:
+        release_db_connection(conn)
 
 def remove_user_subscription(user_id: int) -> bool:
-    with get_db_connection() as conn:
+    conn = get_db_connection()
+    try:
         with conn.cursor() as cursor:
             cursor.execute("DELETE FROM subscriptions WHERE user_id = %s", (user_id,))
             deleted = cursor.rowcount > 0
             conn.commit()
-    return deleted
+            return deleted
+    finally:
+        release_db_connection(conn)
 
 def get_subscription_details(user_id: int) -> Optional[str]:
-    with get_db_connection() as conn:
-        with conn.cursor() as cursor:
+    conn = get_db_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
             cursor.execute("SELECT expiry_time FROM subscriptions WHERE user_id = %s", (user_id,))
             row = cursor.fetchone()
-    return row["expiry_time"].strftime("%Y-%m-%d %H:%M:%S") if row else None
+            return row["expiry_time"].strftime("%Y-%m-%d %H:%M:%S") if row else None
+    finally:
+        release_db_connection(conn)
 
 def is_user_active(user_id: int) -> bool:
-    with get_db_connection() as conn:
-        with conn.cursor() as cursor:
+    conn = get_db_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
             cursor.execute("SELECT expiry_time FROM subscriptions WHERE user_id = %s", (user_id,))
             row = cursor.fetchone()
 
@@ -173,26 +220,35 @@ def is_user_active(user_id: int) -> bool:
                 return False
 
             return True
+    finally:
+        release_db_connection(conn)
 
 def get_all_active_users() -> List[int]:
     now = datetime.datetime.now()
-    with get_db_connection() as conn:
-        with conn.cursor() as cursor:
+    conn = get_db_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
             cursor.execute("SELECT user_id FROM subscriptions WHERE expiry_time > %s", (now,))
             return [row["user_id"] for row in cursor.fetchall()]
+    finally:
+        release_db_connection(conn)
 
 def get_stats_data() -> Tuple[int, int]:
     now = datetime.datetime.now()
-    with get_db_connection() as conn:
-        with conn.cursor() as cursor:
+    conn = get_db_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
             cursor.execute("SELECT COUNT(*) as count FROM videos")
             total_videos = cursor.fetchone()["count"]
             cursor.execute("SELECT COUNT(*) as count FROM subscriptions WHERE expiry_time > %s", (now,))
             active_users = cursor.fetchone()["count"]
             return total_videos, active_users
+    finally:
+        release_db_connection(conn)
 
-# Initialize Database
+# Initialize Database Pool & Tables
 try:
+    init_db_pool()
     init_db()
     cleanup_expired_users()
 except Exception as err:
@@ -580,10 +636,13 @@ async def auto_upload_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption = update.message.caption or ""
 
     def _insert():
-        with get_db_connection() as conn:
+        conn = get_db_connection()
+        try:
             with conn.cursor() as cursor:
                 cursor.execute("INSERT INTO videos (title, file_id) VALUES (%s, %s)", (caption, file_id))
                 conn.commit()
+        finally:
+            release_db_connection(conn)
 
     await asyncio.to_thread(_insert)
     await update.message.reply_text("✅ **Video Saved to Database!**", parse_mode="Markdown")
@@ -611,4 +670,4 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo_received))
 
     logger.info("🚀 Enhanced PostgreSQL Bot is Running Smoothly!")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
