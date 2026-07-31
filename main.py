@@ -53,7 +53,6 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
 RAW_DATABASE_URL = os.getenv("DATABASE_URL")
 
-# HARDCODED ADMIN ID & CHANNEL ID
 ADMIN_ID = 7572036863
 ALLOWED_CHANNEL_ID = -1004403159967
 
@@ -66,7 +65,6 @@ if DATABASE_URL and "sslmode" not in DATABASE_URL:
     connector = "&" if "?" in DATABASE_URL else "?"
     DATABASE_URL = f"{DATABASE_URL}{connector}sslmode=require"
 
-# DATABASE CONNECTION POOL
 db_pool = None
 
 QR_FILE_ID = os.getenv("QR_FILE_ID", "AgACAgUAAxkBAAMFamo9AXr8yxJhM9AJuipowCr2a9UAAvobaxtNyVFXq59REp-3CE8BAAMCAAN5AAM9BA")
@@ -74,16 +72,14 @@ QR_FILE_ID = os.getenv("QR_FILE_ID", "AgACAgUAAxkBAAMFamo9AXr8yxJhM9AJuipowCr2a9
 USER_QR_MESSAGES = {}
 USER_LOCKS = {}
 
-# HIDDEN AUTO-DELETE TRACKERS
 USER_SENT_MESSAGES = {}
 USER_INACTIVITY_TASKS = {}
-INACTIVITY_TIMEOUT = 300  # 5 Minutes = 300 Seconds
+INACTIVITY_TIMEOUT = 300  # 5 Minutes
 
 # ---------------------------------------------------------
-# HIDDEN AUTO-DELETE UTILITIES
+# UTILITIES
 # ---------------------------------------------------------
 def track_message(user_id: int, message_id: int):
-    """Tracks sent messages for silent deletion later"""
     if user_id == ADMIN_ID:
         return
     if user_id not in USER_SENT_MESSAGES:
@@ -91,7 +87,6 @@ def track_message(user_id: int, message_id: int):
     USER_SENT_MESSAGES[user_id].append(message_id)
 
 async def _silent_delete_job(user_id: int, context: ContextTypes.DEFAULT_TYPE):
-    """Silent background cleanup task"""
     try:
         await asyncio.sleep(INACTIVITY_TIMEOUT)
         messages = USER_SENT_MESSAGES.get(user_id, [])
@@ -107,7 +102,6 @@ async def _silent_delete_job(user_id: int, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Error in silent cleanup for user {user_id}: {e}")
 
 def reset_inactivity_timer(user_id: int, context: ContextTypes.DEFAULT_TYPE):
-    """Resets the 5-minute silent timer on interaction"""
     if user_id == ADMIN_ID:
         return
     if user_id in USER_INACTIVITY_TASKS:
@@ -119,7 +113,7 @@ def reset_inactivity_timer(user_id: int, context: ContextTypes.DEFAULT_TYPE):
     USER_INACTIVITY_TASKS[user_id] = task
 
 # ---------------------------------------------------------
-# 3. DATABASE ENGINE (POSTGRESQL WITH CONNECTION POOL)
+# 3. DATABASE ENGINE
 # ---------------------------------------------------------
 def init_pool():
     global db_pool
@@ -159,10 +153,6 @@ def init_db():
                     file_id VARCHAR(255) UNIQUE NOT NULL,
                     caption TEXT
                 );
-            """)
-            cur.execute("""
-                ALTER TABLE videos 
-                ADD COLUMN IF NOT EXISTS caption TEXT;
             """)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS subscriptions (
@@ -388,7 +378,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await asyncio.to_thread(register_user_db, user.id, user.first_name)
 
-    # Escaped safe display name
     safe_name = user.first_name.replace("_", "\\_").replace("*", "\\*") if user.first_name else "User"
 
     welcome_text = (
@@ -409,7 +398,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         track_message(user.id, msg.message_id)
     else:
         msg = await update.message.reply_text(welcome_text, reply_markup=get_main_menu_keyboard(), parse_mode="Markdown")
-        track_message(user.id, update.message.message_id)
+        if update.message:
+            track_message(user.id, update.message.message_id)
         track_message(user.id, msg.message_id)
 
 async def handle_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -507,7 +497,7 @@ async def handle_navigation(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await query.answer("⚠️ Pehle koi video nahi hai!", show_alert=True)
                 return
-        else:  # nav_next
+        else:
             if idx < len(history) - 1:
                 idx += 1
                 video = await asyncio.to_thread(get_video_by_file_id, history[idx])
@@ -642,20 +632,17 @@ async def auto_upload_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg:
         return
 
-    # 1. CHANNEL SECURITY & ID CHECK
     if update.channel_post:
         logger.info(f"Incoming Post from Channel ID: {update.channel_post.chat.id}")
         if update.channel_post.chat.id != ALLOWED_CHANNEL_ID:
             logger.warning(f"Ignored video from unauthorized channel ID: {update.channel_post.chat.id}")
             return
 
-    # 2. PRIVATE CHAT ADMIN CHECK
     if update.message:
         if update.message.from_user and update.message.from_user.id != ADMIN_ID:
             await update.message.reply_text("⚠️ Access Denied! Only Admin can upload videos directly.")
             return
 
-    # 3. EXTRACT FILE ID
     file_id = None
     if msg.video:
         file_id = msg.video.file_id
@@ -667,7 +654,6 @@ async def auto_upload_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     caption = msg.caption or ""
 
-    # 4. DATABASE SAVE LOGIC
     def _quick_db_save():
         conn = None
         try:
@@ -688,7 +674,6 @@ async def auto_upload_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if conn:
                 release_db(conn)
 
-    # 5. EXECUTION & RESPONSE
     try:
         rows = await asyncio.to_thread(_quick_db_save)
 
@@ -840,7 +825,7 @@ def main():
         .build()
     )
 
-    # User Handlers Registration
+    # Handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_buy, pattern="^buy_"))
     app.add_handler(CallbackQueryHandler(open_course, pattern="^open_course$"))
@@ -848,17 +833,16 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_navigation, pattern="^nav_"))
     app.add_handler(CallbackQueryHandler(check_status_callback, pattern="^check_status$"))
 
-    # Admin Command Handlers
+    # Admin Handlers
     app.add_handler(CommandHandler("grant", grant_cmd))
     app.add_handler(CommandHandler("revoke", revoke_cmd))
     app.add_handler(CommandHandler("userinfo", userinfo_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
 
-    # Media & Approval Handlers
     app.add_handler(CallbackQueryHandler(handle_approval, pattern="^(app_|rej_)"))
-    
-    # Strictly Filter Videos / Document Videos for Upload logic
+
+    # Channel and Media Handlers
     app.add_handler(
         MessageHandler(
             (filters.VIDEO | filters.Document.VIDEO),
@@ -868,7 +852,8 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, handle_photo_received))
 
     logger.info("Bot is running seamlessly...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Explicitly set allowed_updates to capture all necessary updates including channel posts
+    app.run_polling(allowed_updates=["message", "edited_message", "channel_post", "edited_channel_post", "callback_query"])
 
 if __name__ == "__main__":
     main()
