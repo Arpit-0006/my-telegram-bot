@@ -74,7 +74,7 @@ QR_FILE_ID = os.getenv("QR_FILE_ID", "AgACAgUAAxkBAAMFamo9AXr8yxJhM9AJuipowCr2a9
 USER_QR_MESSAGES = {}
 USER_LOCKS = {}
 
-# HIDDEN AUTO-DELETE TRACKERS (NO TEXT TO USER)
+# HIDDEN AUTO-DELETE TRACKERS
 USER_SENT_MESSAGES = {}
 USER_INACTIVITY_TASKS = {}
 INACTIVITY_TIMEOUT = 300  # 5 Minutes = 300 Seconds
@@ -91,7 +91,7 @@ def track_message(user_id: int, message_id: int):
     USER_SENT_MESSAGES[user_id].append(message_id)
 
 async def _silent_delete_job(user_id: int, context: ContextTypes.DEFAULT_TYPE):
-    """Silent background cleanup task - No Text Shown"""
+    """Silent background cleanup task"""
     try:
         await asyncio.sleep(INACTIVITY_TIMEOUT)
         messages = USER_SENT_MESSAGES.get(user_id, [])
@@ -107,7 +107,7 @@ async def _silent_delete_job(user_id: int, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Error in silent cleanup for user {user_id}: {e}")
 
 def reset_inactivity_timer(user_id: int, context: ContextTypes.DEFAULT_TYPE):
-    """Resets the 5-minute silent timer on any new user interaction"""
+    """Resets the 5-minute silent timer on interaction"""
     if user_id == ADMIN_ID:
         return
     if user_id in USER_INACTIVITY_TASKS:
@@ -140,7 +140,6 @@ def get_db():
         conn.autocommit = False
         return conn
     except Exception:
-        # Fallback reconnect attempt
         init_pool()
         return db_pool.getconn()
 
@@ -189,7 +188,6 @@ def init_db():
             release_db(conn)
 
 def register_user_db(user_id: int, first_name: str):
-    """Saves or updates user profiles for broadcasts"""
     conn = None
     try:
         conn = get_db()
@@ -262,12 +260,13 @@ def set_user_subscription_db(user_id: int, hours: int):
     try:
         conn = get_db()
         with conn.cursor() as cur:
+            interval_str = f"{hours} hours"
             cur.execute("""
                 INSERT INTO subscriptions (user_id, expiry_time)
-                VALUES (%s, NOW() + (%s || ' hours')::INTERVAL)
+                VALUES (%s, NOW() + %s::INTERVAL)
                 ON CONFLICT (user_id) DO UPDATE 
-                SET expiry_time = GREATEST(subscriptions.expiry_time, NOW()) + (%s || ' hours')::INTERVAL;
-            """, (user_id, str(hours), str(hours)))
+                SET expiry_time = GREATEST(subscriptions.expiry_time, NOW()) + %s::INTERVAL;
+            """, (user_id, interval_str, interval_str))
             conn.commit()
     except Exception as e:
         if conn:
@@ -389,8 +388,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await asyncio.to_thread(register_user_db, user.id, user.first_name)
 
+    # Escaped safe display name
+    safe_name = user.first_name.replace("_", "\\_").replace("*", "\\*") if user.first_name else "User"
+
     welcome_text = (
-        f"👋 **Namaste {user.first_name}! Welcome to Premium Video Store.**\n\n"
+        f"👋 **Namaste {safe_name}! Welcome to Premium Video Store.**\n\n"
         "📜 **PRICING PACKAGES:**\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
         "🥉 **Basic Pass:** ₹10 ➔ 24 Hours Access\n"
@@ -584,10 +586,12 @@ async def handle_photo_received(update: Update, context: ContextTypes.DEFAULT_TY
         [InlineKeyboardButton("❌ Reject Payment", callback_data=f"rej_{user.id}")],
     ])
 
+    safe_name = user.first_name.replace("_", "\\_").replace("*", "\\*") if user.first_name else "User"
+
     await context.bot.send_photo(
         chat_id=ADMIN_ID,
         photo=photo_file_id,
-        caption=f"📥 **NEW PAYMENT SCREENSHOT!**\n\n👤 **User:** {user.first_name}\n🆔 **User ID:** `{user.id}`",
+        caption=f"📥 **NEW PAYMENT SCREENSHOT!**\n\n👤 **User:** {safe_name}\n🆔 **User ID:** `{user.id}`",
         reply_markup=admin_markup,
         parse_mode="Markdown",
     )
@@ -634,7 +638,6 @@ async def handle_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
         track_message(target_user_id, sent_msg.message_id)
 
 async def auto_upload_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Channel post ya normal message me se content extract karein
     msg = update.channel_post or update.message
     if not msg:
         return
@@ -652,7 +655,7 @@ async def auto_upload_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⚠️ Access Denied! Only Admin can upload videos directly.")
             return
 
-    # 3. EXTRACT FILE ID (Video ya Document Video)
+    # 3. EXTRACT FILE ID
     file_id = None
     if msg.video:
         file_id = msg.video.file_id
@@ -691,12 +694,12 @@ async def auto_upload_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if rows > 0:
             if update.message:
-                await update.message.reply_text("Video added in data base")
+                await update.message.reply_text("Video added in database")
             elif update.channel_post:
                 logger.info(f"✅ Video successfully added to DB from Channel: {file_id}")
                 await context.bot.send_message(
                     chat_id=update.channel_post.chat.id,
-                    text="Video added in data base",
+                    text="Video added in database",
                     reply_to_message_id=update.channel_post.message_id
                 )
         else:
@@ -855,17 +858,17 @@ def main():
     # Media & Approval Handlers
     app.add_handler(CallbackQueryHandler(handle_approval, pattern="^(app_|rej_)"))
     
-    # Updated Fixed Handler: Handles both Channel and Direct Admin Videos
+    # Strictly Filter Videos / Document Videos for Upload logic
     app.add_handler(
         MessageHandler(
-            (filters.VIDEO | filters.Document.VIDEO | filters.ChatType.CHANNEL),
+            (filters.VIDEO | filters.Document.VIDEO),
             auto_upload_video
         )
     )
     app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, handle_photo_received))
 
     logger.info("Bot is running seamlessly...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
