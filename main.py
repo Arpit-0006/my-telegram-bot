@@ -3,17 +3,12 @@ import datetime
 import logging
 import os
 import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import psycopg2
 from psycopg2 import pool
 from psycopg2.extras import RealDictCursor
 
-from telegram import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Update,
-    InputMediaVideo
-)
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaVideo, Update
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
@@ -176,7 +171,6 @@ def init_db():
                     expiry_time TIMESTAMP WITH TIME ZONE NOT NULL
                 );
             """)
-            # NEW FEATURE TABLE: Track total users
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     user_id BIGINT PRIMARY KEY,
@@ -195,7 +189,7 @@ def init_db():
             release_db(conn)
 
 def register_user_db(user_id: int, first_name: str):
-    """New helper to save user profiles for broadcasts"""
+    """Saves or updates user profiles for broadcasts"""
     conn = None
     try:
         conn = get_db()
@@ -350,7 +344,6 @@ def get_all_active_users_db():
             release_db(conn)
 
 def get_all_users_db():
-    """New feature: Get all registered users for broadcast"""
     conn = None
     try:
         conn = get_db()
@@ -394,7 +387,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     reset_inactivity_timer(user.id, context)
     
-    # Save user record
     await asyncio.to_thread(register_user_db, user.id, user.first_name)
 
     welcome_text = (
@@ -646,19 +638,19 @@ async def auto_upload_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg:
         return
 
-    # STRICT FILTER 1: CHANNEL CHECK
+    # 1. CHANNEL CHECK
     if update.channel_post:
         if update.channel_post.chat.id != ALLOWED_CHANNEL_ID:
             logger.warning(f"Ignored video from unauthorized channel ID: {update.channel_post.chat.id}")
             return
 
-    # STRICT FILTER 2: PRIVATE CHAT CHECK (Only Admin allowed)
+    # 2. PRIVATE CHAT CHECK (Only Admin allowed)
     if update.message:
-        if update.message.from_user.id != ADMIN_ID:
+        if update.message.from_user and update.message.from_user.id != ADMIN_ID:
             await update.message.reply_text("⚠️ Access Denied! Only Admin can upload videos directly.")
             return
 
-    # Extract File ID
+    # 3. Extract File ID
     file_id = None
     if msg.video:
         file_id = msg.video.file_id
@@ -670,6 +662,7 @@ async def auto_upload_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     caption = msg.caption or ""
 
+    # 4. Database Save Helper
     def _quick_db_save():
         conn = None
         try:
@@ -681,25 +674,37 @@ async def auto_upload_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 conn.commit()
                 return cur.rowcount
-        except Exception:
+        except Exception as e:
             if conn:
                 conn.rollback()
+            logger.error(f"Database insertion error: {e}")
             return 0
         finally:
             if conn:
                 release_db(conn)
 
+    # 5. Async Execution and Replies
     try:
         rows = await asyncio.to_thread(_quick_db_save)
-        if update.message and rows > 0:
-            await update.message.reply_text("⚡ Video Instant Save ho gayi!")
-        elif update.message and rows == 0:
-            await update.message.reply_text("ℹ️ Ye Video pehle se Database me save hai.")
-        
-        if update.channel_post:
-            logger.info(f"✅ Video automatically saved from Channel: {file_id}")
+
+        if rows > 0:
+            if update.message:
+                await update.message.reply_text("Video added in data base")
+            elif update.channel_post:
+                logger.info(f"✅ Video successfully added to DB from Channel: {file_id}")
+                await context.bot.send_message(
+                    chat_id=update.channel_post.chat.id,
+                    text="Video added in data base",
+                    reply_to_message_id=update.channel_post.message_id,
+                )
+        else:
+            if update.message:
+                await update.message.reply_text("ℹ️ Ye Video pehle se Database me save hai.")
+            elif update.channel_post:
+                logger.info(f"ℹ️ Video already exists in DB: {file_id}")
+
     except Exception as e:
-        logger.error(f"Video Save DB Error: {e}")
+        logger.error(f"Error processing auto_upload_video: {e}")
 
 # ---------------------------------------------------------
 # 7. ADMIN COMMANDS
@@ -830,7 +835,7 @@ def main():
         .build()
     )
 
-    # Handlers Registration
+    # User Handlers Registration
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_buy, pattern="^buy_"))
     app.add_handler(CallbackQueryHandler(open_course, pattern="^open_course$"))
@@ -838,7 +843,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_navigation, pattern="^nav_"))
     app.add_handler(CallbackQueryHandler(check_status_callback, pattern="^check_status$"))
 
-    # Admin Handlers
+    # Admin Command Handlers
     app.add_handler(CommandHandler("grant", grant_cmd))
     app.add_handler(CommandHandler("revoke", revoke_cmd))
     app.add_handler(CommandHandler("userinfo", userinfo_cmd))
@@ -856,7 +861,7 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, handle_photo_received))
 
     logger.info("Bot is running seamlessly...")
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
