@@ -5,6 +5,7 @@ import os
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import psycopg2
+from psycopg2 import pool
 from psycopg2.extras import RealDictCursor
 
 from telegram import (
@@ -66,6 +67,13 @@ if RAW_DATABASE_URL and RAW_DATABASE_URL.startswith("postgres://"):
 else:
     DATABASE_URL = RAW_DATABASE_URL
 
+if DATABASE_URL and "sslmode" not in DATABASE_URL:
+    connector = "&" if "?" in DATABASE_URL else "?"
+    DATABASE_URL = f"{DATABASE_URL}{connector}sslmode=require"
+
+# DATABASE CONNECTION POOL
+db_pool = None
+
 QR_FILE_ID = os.getenv("QR_FILE_ID", "AgACAgUAAxkBAAMFamo9AXr8yxJhM9AJuipowCr2a9UAAvobaxtNyVFXq59REp-3CE8BAAMCAAN5AAM9BA")
 
 USER_QR_MESSAGES = {}
@@ -108,25 +116,43 @@ def reset_inactivity_timer(user_id: int, context: ContextTypes.DEFAULT_TYPE):
     if user_id == ADMIN_ID:
         return
     if user_id in USER_INACTIVITY_TASKS:
-        USER_INACTIVITY_TASKS[user_id].cancel()
+        task = USER_INACTIVITY_TASKS[user_id]
+        if not task.done():
+            task.cancel()
     
     task = asyncio.create_task(_silent_delete_job(user_id, context))
     USER_INACTIVITY_TASKS[user_id] = task
 
 # ---------------------------------------------------------
-# 3. DATABASE ENGINE (POSTGRESQL)
+# 3. DATABASE ENGINE (POSTGRESQL WITH CONNECTION POOL)
 # ---------------------------------------------------------
-def get_db():
+def init_pool():
+    global db_pool
     if not DATABASE_URL:
         raise ValueError("DATABASE_URL environment variable missing!")
-    
-    if "sslmode" not in DATABASE_URL:
-        connector = "&" if "?" in DATABASE_URL else "?"
-        url_with_ssl = f"{DATABASE_URL}{connector}sslmode=require"
-    else:
-        url_with_ssl = DATABASE_URL
-        
-    return psycopg2.connect(url_with_ssl, cursor_factory=RealDictCursor, connect_timeout=10)
+    try:
+        db_pool = pool.SimpleConnectionPool(1, 20, dsn=DATABASE_URL)
+        logger.info("✅ Database Connection Pool initialized successfully.")
+    except Exception as e:
+        logger.error(f"❌ Connection Pool Initialization Error: {e}")
+
+def get_db():
+    global db_pool
+    if not db_pool:
+        init_pool()
+    try:
+        conn = db_pool.getconn()
+        conn.autocommit = False
+        return conn
+    except Exception:
+        # Fallback reconnect attempt
+        init_pool()
+        return db_pool.getconn()
+
+def release_db(conn):
+    global db_pool
+    if db_pool and conn:
+        db_pool.putconn(conn)
 
 def init_db():
     conn = None
@@ -150,19 +176,49 @@ def init_db():
                     expiry_time TIMESTAMP WITH TIME ZONE NOT NULL
                 );
             """)
+            # NEW FEATURE TABLE: Track total users
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id BIGINT PRIMARY KEY,
+                    first_name TEXT,
+                    joined_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                );
+            """)
             conn.commit()
-        logger.info("✅ Database initialized successfully.")
+        logger.info("✅ Database tables checked/initialized successfully.")
     except Exception as e:
+        if conn:
+            conn.rollback()
         logger.error(f"❌ Database Init Error: {e}")
     finally:
         if conn:
-            conn.close()
+            release_db(conn)
+
+def register_user_db(user_id: int, first_name: str):
+    """New helper to save user profiles for broadcasts"""
+    conn = None
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO users (user_id, first_name)
+                VALUES (%s, %s)
+                ON CONFLICT (user_id) DO UPDATE SET first_name = EXCLUDED.first_name;
+            """, (user_id, first_name))
+            conn.commit()
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"DB Error (register_user_db): {e}")
+    finally:
+        if conn:
+            release_db(conn)
 
 def get_random_video_db():
     conn = None
     try:
         conn = get_db()
-        with conn.cursor() as cur:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT file_id, caption FROM videos ORDER BY RANDOM() LIMIT 1;")
             return cur.fetchone()
     except Exception as e:
@@ -170,13 +226,13 @@ def get_random_video_db():
         return None
     finally:
         if conn:
-            conn.close()
+            release_db(conn)
 
 def get_video_by_file_id(file_id: str):
     conn = None
     try:
         conn = get_db()
-        with conn.cursor() as cur:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT file_id, caption FROM videos WHERE file_id = %s;", (file_id,))
             return cur.fetchone()
     except Exception as e:
@@ -184,7 +240,7 @@ def get_video_by_file_id(file_id: str):
         return None
     finally:
         if conn:
-            conn.close()
+            release_db(conn)
 
 def is_user_subscribed_db(user_id: int) -> bool:
     if user_id == ADMIN_ID:
@@ -192,7 +248,7 @@ def is_user_subscribed_db(user_id: int) -> bool:
     conn = None
     try:
         conn = get_db()
-        with conn.cursor() as cur:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT expiry_time FROM subscriptions WHERE user_id = %s;", (user_id,))
             row = cur.fetchone()
             if not row:
@@ -205,7 +261,7 @@ def is_user_subscribed_db(user_id: int) -> bool:
         return False
     finally:
         if conn:
-            conn.close()
+            release_db(conn)
 
 def set_user_subscription_db(user_id: int, hours: int):
     conn = None
@@ -220,10 +276,12 @@ def set_user_subscription_db(user_id: int, hours: int):
             """, (user_id, str(hours), str(hours)))
             conn.commit()
     except Exception as e:
+        if conn:
+            conn.rollback()
         logger.error(f"DB Error (set_user_subscription_db): {e}")
     finally:
         if conn:
-            conn.close()
+            release_db(conn)
 
 def remove_user_subscription_db(user_id: int) -> bool:
     conn = None
@@ -235,17 +293,19 @@ def remove_user_subscription_db(user_id: int) -> bool:
             conn.commit()
             return deleted
     except Exception as e:
+        if conn:
+            conn.rollback()
         logger.error(f"DB Error (remove_user_subscription_db): {e}")
         return False
     finally:
         if conn:
-            conn.close()
+            release_db(conn)
 
 def get_subscription_details_db(user_id: int):
     conn = None
     try:
         conn = get_db()
-        with conn.cursor() as cur:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT expiry_time FROM subscriptions WHERE user_id = %s;", (user_id,))
             row = cur.fetchone()
             return row['expiry_time'].strftime("%Y-%m-%d %H:%M:%S UTC") if row else None
@@ -254,30 +314,32 @@ def get_subscription_details_db(user_id: int):
         return None
     finally:
         if conn:
-            conn.close()
+            release_db(conn)
 
 def get_stats_data_db():
     conn = None
     try:
         conn = get_db()
-        with conn.cursor() as cur:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT COUNT(*) as count FROM videos;")
             v_count = cur.fetchone()['count']
             cur.execute("SELECT COUNT(*) as count FROM subscriptions WHERE expiry_time > NOW();")
             u_count = cur.fetchone()['count']
-            return v_count, u_count
+            cur.execute("SELECT COUNT(*) as count FROM users;")
+            total_users = cur.fetchone()['count']
+            return v_count, u_count, total_users
     except Exception as e:
         logger.error(f"DB Error (get_stats_data_db): {e}")
-        return 0, 0
+        return 0, 0, 0
     finally:
         if conn:
-            conn.close()
+            release_db(conn)
 
 def get_all_active_users_db():
     conn = None
     try:
         conn = get_db()
-        with conn.cursor() as cur:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT user_id FROM subscriptions WHERE expiry_time > NOW();")
             return [row['user_id'] for row in cur.fetchall()]
     except Exception as e:
@@ -285,7 +347,22 @@ def get_all_active_users_db():
         return []
     finally:
         if conn:
-            conn.close()
+            release_db(conn)
+
+def get_all_users_db():
+    """New feature: Get all registered users for broadcast"""
+    conn = None
+    try:
+        conn = get_db()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT user_id FROM users;")
+            return [row['user_id'] for row in cur.fetchall()]
+    except Exception as e:
+        logger.error(f"DB Error (get_all_users_db): {e}")
+        return []
+    finally:
+        if conn:
+            release_db(conn)
 
 # ---------------------------------------------------------
 # 4. KEYBOARD LAYOUTS
@@ -316,6 +393,9 @@ def get_nav_keyboard():
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     reset_inactivity_timer(user.id, context)
+    
+    # Save user record
+    await asyncio.to_thread(register_user_db, user.id, user.first_name)
 
     welcome_text = (
         f"👋 **Namaste {user.first_name}! Welcome to Premium Video Store.**\n\n"
@@ -424,6 +504,7 @@ async def handle_navigation(update: Update, context: ContextTypes.DEFAULT_TYPE):
         history = context.user_data.get('history', [])
         idx = context.user_data.get('history_idx', -1)
         action = query.data
+        video = None
 
         if action == "nav_prev":
             if idx > 0:
@@ -600,9 +681,13 @@ async def auto_upload_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 conn.commit()
                 return cur.rowcount
+        except Exception:
+            if conn:
+                conn.rollback()
+            return 0
         finally:
             if conn:
-                conn.close()
+                release_db(conn)
 
     try:
         rows = await asyncio.to_thread(_quick_db_save)
@@ -612,7 +697,7 @@ async def auto_upload_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("ℹ️ Ye Video pehle se Database me save hai.")
         
         if update.channel_post:
-            logger.info(f"✅ Video automatically saved from 'Data base' Channel: {file_id}")
+            logger.info(f"✅ Video automatically saved from Channel: {file_id}")
     except Exception as e:
         logger.error(f"Video Save DB Error: {e}")
 
@@ -672,12 +757,13 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
 
-    v_count, u_count = await asyncio.to_thread(get_stats_data_db)
+    v_count, u_count, total_users = await asyncio.to_thread(get_stats_data_db)
     msg = (
         "📊 **BOT DASHBOARD STATS**\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
         f"🎬 **Total Videos in DB:** {v_count}\n"
         f"👥 **Active Subscribers:** {u_count}\n"
+        f"🌐 **Total Registered Users:** {total_users}\n"
         "━━━━━━━━━━━━━━━━━━━━━"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
@@ -687,11 +773,25 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not context.args:
-        await update.message.reply_text("⚠️ Format: `/broadcast <Aapka Message>`", parse_mode="Markdown")
+        await update.message.reply_text("⚠️ Format:\n`/broadcast <Message>` (Sirf Active Users ko)\n`/broadcast all <Message>` (Sabhi Users ko)", parse_mode="Markdown")
         return
 
-    broadcast_msg = " ".join(context.args)
-    users = await asyncio.to_thread(get_all_active_users_db)
+    target_type = "active"
+    args = context.args.copy()
+
+    if args[0].lower() == "all":
+        target_type = "all"
+        args.pop(0)
+
+    broadcast_msg = " ".join(args)
+    if not broadcast_msg:
+        await update.message.reply_text("⚠️ Content khaali hai! Message likhein.", parse_mode="Markdown")
+        return
+
+    if target_type == "all":
+        users = await asyncio.to_thread(get_all_users_db)
+    else:
+        users = await asyncio.to_thread(get_all_active_users_db)
 
     sent = 0
     for uid in users:
@@ -703,12 +803,20 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-    await update.message.reply_text(f"📢 Broadcast `{sent}/{len(users)}` active users ko bhej diya gaya.", parse_mode="Markdown")
+    await update.message.reply_text(f"📢 Broadcast `{sent}/{len(users)}` (`{target_type.upper()}`) users ko bhej diya gaya.", parse_mode="Markdown")
 
 # ---------------------------------------------------------
 # 8. MAIN ENTRY POINT
 # ---------------------------------------------------------
 def main():
+    if not BOT_TOKEN:
+        logger.error("❌ BOT_TOKEN environment variable is missing!")
+        return
+    if not DATABASE_URL:
+        logger.error("❌ DATABASE_URL environment variable is missing!")
+        return
+
+    init_pool()
     init_db()
 
     app = (
