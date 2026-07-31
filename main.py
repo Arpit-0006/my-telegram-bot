@@ -562,7 +562,7 @@ async def check_status_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await query.answer("❌ Subscription Expired or Inactive.", show_alert=True)
 
 # ---------------------------------------------------------
-# 6. STRICT VIDEO AUTO-SAVE & APPROVAL SYSTEM
+# 6. VIDEO UPLOAD & PAYMENT APPROVAL SYSTEM
 # ---------------------------------------------------------
 async def handle_photo_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -634,23 +634,25 @@ async def handle_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
         track_message(target_user_id, sent_msg.message_id)
 
 async def auto_upload_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Channel post ya normal message me se content extract karein
     msg = update.channel_post or update.message
     if not msg:
         return
 
-    # 1. CHANNEL CHECK
+    # 1. CHANNEL SECURITY & ID CHECK
     if update.channel_post:
+        logger.info(f"Incoming Post from Channel ID: {update.channel_post.chat.id}")
         if update.channel_post.chat.id != ALLOWED_CHANNEL_ID:
             logger.warning(f"Ignored video from unauthorized channel ID: {update.channel_post.chat.id}")
             return
 
-    # 2. PRIVATE CHAT CHECK (Only Admin allowed)
+    # 2. PRIVATE CHAT ADMIN CHECK
     if update.message:
         if update.message.from_user and update.message.from_user.id != ADMIN_ID:
             await update.message.reply_text("⚠️ Access Denied! Only Admin can upload videos directly.")
             return
 
-    # 3. Extract File ID
+    # 3. EXTRACT FILE ID (Video ya Document Video)
     file_id = None
     if msg.video:
         file_id = msg.video.file_id
@@ -662,7 +664,7 @@ async def auto_upload_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     caption = msg.caption or ""
 
-    # 4. Database Save Helper
+    # 4. DATABASE SAVE LOGIC
     def _quick_db_save():
         conn = None
         try:
@@ -683,7 +685,7 @@ async def auto_upload_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if conn:
                 release_db(conn)
 
-    # 5. Async Execution and Replies
+    # 5. EXECUTION & RESPONSE
     try:
         rows = await asyncio.to_thread(_quick_db_save)
 
@@ -695,7 +697,7 @@ async def auto_upload_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(
                     chat_id=update.channel_post.chat.id,
                     text="Video added in data base",
-                    reply_to_message_id=update.channel_post.message_id,
+                    reply_to_message_id=update.channel_post.message_id
                 )
         else:
             if update.message:
@@ -850,11 +852,13 @@ def main():
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
 
-    # Media Handlers
+    # Media & Approval Handlers
     app.add_handler(CallbackQueryHandler(handle_approval, pattern="^(app_|rej_)"))
+    
+    # Updated Fixed Handler: Handles both Channel and Direct Admin Videos
     app.add_handler(
         MessageHandler(
-            (filters.VIDEO | filters.Document.VIDEO) & (filters.ChatType.PRIVATE | filters.ChatType.CHANNEL),
+            (filters.VIDEO | filters.Document.VIDEO | filters.ChatType.CHANNEL),
             auto_upload_video
         )
     )
