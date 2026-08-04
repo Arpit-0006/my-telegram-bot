@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import html
 import logging
 import os
 import threading
@@ -79,6 +80,7 @@ USER_LOCKS = {}
 USER_SENT_MESSAGES = {}
 USER_INACTIVITY_TASKS = {}
 INACTIVITY_TIMEOUT = 300  # 5 Minutes
+MAX_TRACKED_MESSAGES_PER_USER = 50
 
 # ---------------------------------------------------------
 # UTILITIES
@@ -88,7 +90,11 @@ def track_message(user_id: int, message_id: int):
         return
     if user_id not in USER_SENT_MESSAGES:
         USER_SENT_MESSAGES[user_id] = []
+    
     USER_SENT_MESSAGES[user_id].append(message_id)
+    # Memory leak protection: keep only last 50 messages
+    if len(USER_SENT_MESSAGES[user_id]) > MAX_TRACKED_MESSAGES_PER_USER:
+        USER_SENT_MESSAGES[user_id] = USER_SENT_MESSAGES[user_id][-MAX_TRACKED_MESSAGES_PER_USER:]
 
 async def _silent_delete_job(user_id: int, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -100,6 +106,8 @@ async def _silent_delete_job(user_id: int, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
         USER_SENT_MESSAGES[user_id] = []
+        if user_id in USER_LOCKS:
+            del USER_LOCKS[user_id]
     except asyncio.CancelledError:
         pass
     except Exception as e:
@@ -137,6 +145,12 @@ def get_db_connection():
     conn = db_pool.getconn()
     try:
         yield conn
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise e
     finally:
         if db_pool and conn:
             db_pool.putconn(conn)
@@ -145,7 +159,6 @@ def init_db():
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
-                # Removed UNIQUE constraint from file_id to prevent duplicate blocking issues
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS videos (
                         id SERIAL PRIMARY KEY,
@@ -326,15 +339,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await asyncio.to_thread(register_user_db, user.id, user.first_name)
 
-    safe_name = user.first_name.replace("_", "\\_").replace("*", "\\*") if user.first_name else "User"
+    safe_name = html.escape(user.first_name) if user.first_name else "User"
 
     welcome_text = (
-        f"👋 **Namaste {safe_name}! Welcome to Premium Video Store.**\n\n"
-        "📜 **PRICING PACKAGES:**\n"
+        f"👋 <b>Namaste {safe_name}! Welcome to Premium Video Store.</b>\n\n"
+        "📜 <b>PRICING PACKAGES:</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
-        "🥉 **Basic Pass:** ₹10 ➔ 24 Hours Access\n"
-        "🥈 **Weekly Pass:** ₹50 ➔ 7 Days Access\n"
-        "🥇 **Monthly Pass:** ₹150 ➔ 30 Days Access\n"
+        "🥉 <b>Basic Pass:</b> ₹10 ➔ 24 Hours Access\n"
+        "🥈 <b>Weekly Pass:</b> ₹50 ➔ 7 Days Access\n"
+        "🥇 <b>Monthly Pass:</b> ₹150 ➔ 30 Days Access\n"
         "━━━━━━━━━━━━━━━━━━━━━\n\n"
         "👇 Choose an option below:"
     )
@@ -342,10 +355,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.callback_query:
         query = update.callback_query
         await query.answer()
-        msg = await query.message.reply_text(welcome_text, reply_markup=get_main_menu_keyboard(), parse_mode="Markdown")
+        msg = await query.message.reply_text(welcome_text, reply_markup=get_main_menu_keyboard(), parse_mode="HTML")
         track_message(user.id, msg.message_id)
     else:
-        msg = await update.message.reply_text(welcome_text, reply_markup=get_main_menu_keyboard(), parse_mode="Markdown")
+        msg = await update.message.reply_text(welcome_text, reply_markup=get_main_menu_keyboard(), parse_mode="HTML")
         if update.message:
             track_message(user.id, update.message.message_id)
         track_message(user.id, msg.message_id)
@@ -364,11 +377,11 @@ async def handle_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         price, duration = "₹150", "30 Days"
 
     payment_text = (
-        f"💳 **PAYMENT DETAILS ({duration} Plan)**\n\n"
-        f"💵 **Amount to Pay:** {price}\n\n"
-        "📍 **Payment Steps:**\n"
+        f"💳 <b>PAYMENT DETAILS ({duration} Plan)</b>\n\n"
+        f"💵 <b>Amount to Pay:</b> {price}\n\n"
+        "📍 <b>Payment Steps:</b>\n"
         "1. Scan the QR Code below and make payment.\n"
-        "2. Send the payment **Screenshot directly to this chat**.\n\n"
+        "2. Send the payment <b>Screenshot directly to this chat</b>.\n\n"
         "⚡ Instant access will be granted after verification."
     )
 
@@ -379,7 +392,7 @@ async def handle_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         photo=QR_FILE_ID,
         caption=payment_text,
         reply_markup=keyboard,
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
     USER_QR_MESSAGES[user_id] = sent_msg.message_id
     track_message(user_id, sent_msg.message_id)
@@ -404,12 +417,14 @@ async def open_course(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['history'] = [video['file_id']]
     context.user_data['history_idx'] = 0
 
+    caption = video['caption'] if video['caption'] else "✨ <b>Premium Video</b>"
+
     sent_msg = await context.bot.send_video(
         chat_id=user_id,
         video=video['file_id'],
-        caption=video['caption'] or "✨ *Premium Video*",
+        caption=caption,
         reply_markup=get_nav_keyboard(),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
     track_message(user_id, sent_msg.message_id)
 
@@ -463,12 +478,14 @@ async def handle_navigation(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['history'] = history
         context.user_data['history_idx'] = idx
 
+        caption = video['caption'] if video['caption'] else "✨ <b>Premium Video</b>"
+
         try:
             await query.edit_message_media(
                 media=InputMediaVideo(
                     media=video['file_id'],
-                    caption=video['caption'] or "✨ *Premium Video*",
-                    parse_mode="Markdown"
+                    caption=caption,
+                    parse_mode="HTML"
                 ),
                 reply_markup=get_nav_keyboard()
             )
@@ -480,9 +497,9 @@ async def handle_navigation(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sent_msg = await context.bot.send_video(
                 chat_id=query.message.chat_id,
                 video=video['file_id'],
-                caption=video['caption'] or "✨ *Premium Video*",
+                caption=caption,
                 reply_markup=get_nav_keyboard(),
-                parse_mode="Markdown"
+                parse_mode="HTML"
             )
             track_message(user_id, sent_msg.message_id)
 
@@ -512,7 +529,7 @@ async def handle_photo_received(update: Update, context: ContextTypes.DEFAULT_TY
     track_message(user.id, update.message.message_id)
 
     if user and user.id == ADMIN_ID:
-        await update.message.reply_text(f"🖼️ **QR Code File ID:**\n\n`{photo_file_id}`", parse_mode="Markdown")
+        await update.message.reply_text(f"🖼️ <b>QR Code File ID:</b>\n\n<code>{photo_file_id}</code>", parse_mode="HTML")
         return
 
     admin_markup = InlineKeyboardMarkup([
@@ -524,17 +541,17 @@ async def handle_photo_received(update: Update, context: ContextTypes.DEFAULT_TY
         [InlineKeyboardButton("❌ Reject Payment", callback_data=f"rej_{user.id}")],
     ])
 
-    safe_name = user.first_name.replace("_", "\\_").replace("*", "\\*") if user.first_name else "User"
+    safe_name = html.escape(user.first_name) if user.first_name else "User"
 
     await context.bot.send_photo(
         chat_id=ADMIN_ID,
         photo=photo_file_id,
-        caption=f"📥 **NEW PAYMENT SCREENSHOT!**\n\n👤 **User:** {safe_name}\n🆔 **User ID:** `{user.id}`",
+        caption=f"📥 <b>NEW PAYMENT SCREENSHOT!</b>\n\n👤 <b>User:</b> {safe_name}\n🆔 <b>User ID:</b> <code>{user.id}</code>",
         reply_markup=admin_markup,
-        parse_mode="Markdown",
+        parse_mode="HTML",
     )
 
-    msg = await update.message.reply_text("✅ **Screenshot Received!** Admin verification ke baad aapka access active ho jayega.")
+    msg = await update.message.reply_text("✅ <b>Screenshot Received!</b> Admin verification ke baad aapka access active ho jayega.", parse_mode="HTML")
     track_message(user.id, msg.message_id)
 
 async def handle_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -557,21 +574,21 @@ async def handle_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "app":
         hours = int(data[2])
         await asyncio.to_thread(set_user_subscription_db, target_user_id, hours)
-        await query.edit_message_caption(caption=f"✅ **APPROVED:** User `{target_user_id}` ko {hours} Hours ka access de diya.", parse_mode="Markdown")
+        await query.edit_message_caption(caption=f"✅ <b>APPROVED:</b> User <code>{target_user_id}</code> ko {hours} Hours ka access de diya.", parse_mode="HTML")
 
         sent_msg = await context.bot.send_message(
             chat_id=target_user_id,
-            text=f"🎉 **Payment Verified!** Aapko **{hours} Ghante** ka access mil gaya hai. /start dabakar Open Course par click karein!",
-            parse_mode="Markdown"
+            text=f"🎉 <b>Payment Verified!</b> Aapko <b>{hours} Ghante</b> ka access mil gaya hai. /start dabakar Open Course par click karein!",
+            parse_mode="HTML"
         )
         track_message(target_user_id, sent_msg.message_id)
     elif action == "rej":
-        await query.edit_message_caption(caption=f"❌ **REJECTED:** User `{target_user_id}` ka payment reject kiya gaya.", parse_mode="Markdown")
+        await query.edit_message_caption(caption=f"❌ <b>REJECTED:</b> User <code>{target_user_id}</code> ka payment reject kiya gaya.", parse_mode="HTML")
 
         sent_msg = await context.bot.send_message(
             chat_id=target_user_id,
-            text="❌ **Payment Verification Failed!** Please send valid payment screenshot.",
-            parse_mode="Markdown"
+            text="❌ <b>Payment Verification Failed!</b> Please send valid payment screenshot.",
+            parse_mode="HTML"
         )
         track_message(target_user_id, sent_msg.message_id)
 
@@ -624,11 +641,14 @@ async def auto_upload_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("✅ Video added in database")
             elif update.channel_post:
                 logger.info(f"✅ Video successfully added to DB from Channel: {file_id}")
-                await context.bot.send_message(
-                    chat_id=update.channel_post.chat.id,
-                    text="✅ Video added in database",
-                    reply_to_message_id=update.channel_post.message_id
-                )
+                try:
+                    await context.bot.send_message(
+                        chat_id=update.channel_post.chat.id,
+                        text="✅ Video added in database",
+                        reply_to_message_id=update.channel_post.message_id
+                    )
+                except Exception as channel_err:
+                    logger.warning(f"Could not send reply to channel: {channel_err}")
         else:
             if update.message:
                 await update.message.reply_text("❌ Failed to save video in database.")
@@ -649,16 +669,16 @@ async def grant_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_id = int(context.args[0])
         hours = int(context.args[1])
         await asyncio.to_thread(set_user_subscription_db, target_id, hours)
-        await update.message.reply_text(f"✅ User `{target_id}` ko {hours} Hours ka access de diya gaya hai.", parse_mode="Markdown")
+        await update.message.reply_text(f"✅ User <code>{target_id}</code> ko {hours} Hours ka access de diya gaya hai.", parse_mode="HTML")
         
         sent_msg = await context.bot.send_message(
             target_id,
-            f"🎉 **Access Granted!** Admin ne aapko {hours} Hours ka access de diya hai. /start karein!",
-            parse_mode="Markdown"
+            f"🎉 <b>Access Granted!</b> Admin ne aapko {hours} Hours ka access de diya hai. /start karein!",
+            parse_mode="HTML"
         )
         track_message(target_id, sent_msg.message_id)
     except Exception:
-        await update.message.reply_text("⚠️ Format: `/grant <USER_ID> <HOURS>`", parse_mode="Markdown")
+        await update.message.reply_text("⚠️ Format: <code>/grant &lt;USER_ID&gt; &lt;HOURS&gt;</code>", parse_mode="HTML")
 
 async def revoke_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -668,13 +688,13 @@ async def revoke_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_id = int(context.args[0])
         removed = await asyncio.to_thread(remove_user_subscription_db, target_id)
         if removed:
-            await update.message.reply_text(f"🔴 User `{target_id}` ka access revoke kar diya gaya hai.", parse_mode="Markdown")
-            sent_msg = await context.bot.send_message(target_id, "⚠️ Aapka course access Revoke kar diya gaya hai.", parse_mode="Markdown")
+            await update.message.reply_text(f"🔴 User <code>{target_id}</code> ka access revoke kar diya gaya hai.", parse_mode="HTML")
+            sent_msg = await context.bot.send_message(target_id, "⚠️ Aapka course access Revoke kar diya gaya hai.", parse_mode="HTML")
             track_message(target_id, sent_msg.message_id)
         else:
-            await update.message.reply_text(f"⚠️ User `{target_id}` active nahi mila.", parse_mode="Markdown")
+            await update.message.reply_text(f"⚠️ User <code>{target_id}</code> active nahi mila.", parse_mode="HTML")
     except Exception:
-        await update.message.reply_text("⚠️ Format: `/revoke <USER_ID>`", parse_mode="Markdown")
+        await update.message.reply_text("⚠️ Format: <code>/revoke &lt;USER_ID&gt;</code>", parse_mode="HTML")
 
 async def userinfo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -684,11 +704,11 @@ async def userinfo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_id = int(context.args[0])
         expiry = await asyncio.to_thread(get_subscription_details_db, target_id)
         if expiry:
-            await update.message.reply_text(f"👤 **User ID:** `{target_id}`\n⏳ **Expiry Date:** `{expiry}`", parse_mode="Markdown")
+            await update.message.reply_text(f"👤 <b>User ID:</b> <code>{target_id}</code>\n⏳ <b>Expiry Date:</b> <code>{expiry}</code>", parse_mode="HTML")
         else:
-            await update.message.reply_text(f"❌ User `{target_id}` ki koi subscription record nahi mili.", parse_mode="Markdown")
+            await update.message.reply_text(f"❌ User <code>{target_id}</code> ki koi subscription record nahi mili.", parse_mode="HTML")
     except Exception:
-        await update.message.reply_text("⚠️ Format: `/userinfo <USER_ID>`", parse_mode="Markdown")
+        await update.message.reply_text("⚠️ Format: <code>/userinfo &lt;USER_ID&gt;</code>", parse_mode="HTML")
 
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -696,21 +716,21 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     v_count, u_count, total_users = await asyncio.to_thread(get_stats_data_db)
     msg = (
-        "📊 **BOT DASHBOARD STATS**\n"
+        "📊 <b>BOT DASHBOARD STATS</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🎬 **Total Videos in DB:** {v_count}\n"
-        f"👥 **Active Subscribers:** {u_count}\n"
-        f"🌐 **Total Registered Users:** {total_users}\n"
+        f"🎬 <b>Total Videos in DB:</b> {v_count}\n"
+        f"👥 <b>Active Subscribers:</b> {u_count}\n"
+        f"🌐 <b>Total Registered Users:</b> {total_users}\n"
         "━━━━━━━━━━━━━━━━━━━━━"
     )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await update.message.reply_text(msg, parse_mode="HTML")
 
 async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
 
     if not context.args:
-        await update.message.reply_text("⚠️ Format:\n`/broadcast <Message>` (Sirf Active Users ko)\n`/broadcast all <Message>` (Sabhi Users ko)", parse_mode="Markdown")
+        await update.message.reply_text("⚠️ Format:\n<code>/broadcast &lt;Message&gt;</code> (Sirf Active Users ko)\n<code>/broadcast all &lt;Message&gt;</code> (Sabhi Users ko)", parse_mode="HTML")
         return
 
     target_type = "active"
@@ -720,9 +740,9 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_type = "all"
         args.pop(0)
 
-    broadcast_msg = " ".join(args)
+    broadcast_msg = html.escape(" ".join(args))
     if not broadcast_msg:
-        await update.message.reply_text("⚠️ Content khaali hai! Message likhein.", parse_mode="Markdown")
+        await update.message.reply_text("⚠️ Content khaali hai! Message likhein.", parse_mode="HTML")
         return
 
     if target_type == "all":
@@ -733,14 +753,14 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sent = 0
     for uid in users:
         try:
-            sent_m = await context.bot.send_message(uid, f"📢 **ANNOUNCEMENT:**\n\n{broadcast_msg}", parse_mode="Markdown")
+            sent_m = await context.bot.send_message(uid, f"📢 <b>ANNOUNCEMENT:</b>\n\n{broadcast_msg}", parse_mode="HTML")
             track_message(uid, sent_m.message_id)
             sent += 1
             await asyncio.sleep(0.05)
         except Exception:
             pass
 
-    await update.message.reply_text(f"📢 Broadcast `{sent}/{len(users)}` (`{target_type.upper()}`) users ko bhej diya gaya.", parse_mode="Markdown")
+    await update.message.reply_text(f"📢 Broadcast <code>{sent}/{len(users)}</code> (<code>{target_type.upper()}</code>) users ko bhej diya gaya.", parse_mode="HTML")
 
 # ---------------------------------------------------------
 # 8. MAIN ENTRY POINT
