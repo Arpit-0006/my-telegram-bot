@@ -3,7 +3,9 @@ import datetime
 import logging
 import os
 import threading
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, HTTPServer
+
 import psycopg2
 from psycopg2 import pool
 from psycopg2.extras import RealDictCursor
@@ -24,7 +26,7 @@ from telegram.ext import (
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
-        self.send_header('Content-type', 'text/html')
+        self.send_header("Content-type", "text/html")
         self.end_headers()
         self.wfile.write(b"Bot status: ONLINE")
 
@@ -34,7 +36,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
 def run_health_check_server():
     port = int(os.environ.get("PORT", 8080))
     try:
-        server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+        server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
         server.serve_forever()
     except Exception as e:
         print(f"Health Check Server Notice: {e}")
@@ -67,11 +69,13 @@ if DATABASE_URL and "sslmode" not in DATABASE_URL:
 
 db_pool = None
 
-QR_FILE_ID = os.getenv("QR_FILE_ID", "AgACAgUAAxkBAAMFamo9AXr8yxJhM9AJuipowCr2a9UAAvobaxtNyVFXq59REp-3CE8BAAMCAAN5AAM9BA")
+QR_FILE_ID = os.getenv(
+    "QR_FILE_ID",
+    "AgACAgUAAxkBAAMFamo9AXr8yxJhM9AJuipowCr2a9UAAvobaxtNyVFXq59REp-3CE8BAAMCAAN5AAM9BA"
+)
 
 USER_QR_MESSAGES = {}
 USER_LOCKS = {}
-
 USER_SENT_MESSAGES = {}
 USER_INACTIVITY_TASKS = {}
 INACTIVITY_TIMEOUT = 300  # 5 Minutes
@@ -108,243 +112,187 @@ def reset_inactivity_timer(user_id: int, context: ContextTypes.DEFAULT_TYPE):
         task = USER_INACTIVITY_TASKS[user_id]
         if not task.done():
             task.cancel()
-    
+            
     task = asyncio.create_task(_silent_delete_job(user_id, context))
     USER_INACTIVITY_TASKS[user_id] = task
 
 # ---------------------------------------------------------
-# 3. DATABASE ENGINE
+# 3. DATABASE ENGINE (THREAD-SAFE POOL & CONTEXT MANAGER)
 # ---------------------------------------------------------
 def init_pool():
     global db_pool
     if not DATABASE_URL:
         raise ValueError("DATABASE_URL environment variable missing!")
     try:
-        db_pool = pool.SimpleConnectionPool(1, 20, dsn=DATABASE_URL)
-        logger.info("✅ Database Connection Pool initialized successfully.")
+        # Use ThreadedConnectionPool for multi-threaded async execution
+        db_pool = pool.ThreadedConnectionPool(1, 20, dsn=DATABASE_URL)
+        logger.info("✅ Threaded Database Connection Pool initialized successfully.")
     except Exception as e:
         logger.error(f"❌ Connection Pool Initialization Error: {e}")
 
-def get_db():
+@contextmanager
+def get_db_connection():
     global db_pool
     if not db_pool:
         init_pool()
+    conn = db_pool.getconn()
     try:
-        conn = db_pool.getconn()
-        conn.autocommit = False
-        return conn
-    except Exception:
-        init_pool()
-        return db_pool.getconn()
-
-def release_db(conn):
-    global db_pool
-    if db_pool and conn:
-        db_pool.putconn(conn)
+        yield conn
+    finally:
+        if db_pool and conn:
+            db_pool.putconn(conn)
 
 def init_db():
-    conn = None
     try:
-        conn = get_db()
-        with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS videos (
-                    id SERIAL PRIMARY KEY,
-                    file_id VARCHAR(255) UNIQUE NOT NULL,
-                    caption TEXT
-                );
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS subscriptions (
-                    user_id BIGINT PRIMARY KEY,
-                    expiry_time TIMESTAMP WITH TIME ZONE NOT NULL
-                );
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id BIGINT PRIMARY KEY,
-                    first_name TEXT,
-                    joined_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-                );
-            """)
-            conn.commit()
-        logger.info("✅ Database tables checked/initialized successfully.")
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS videos (
+                        id SERIAL PRIMARY KEY,
+                        file_id VARCHAR(255) UNIQUE NOT NULL,
+                        caption TEXT
+                    );
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS subscriptions (
+                        user_id BIGINT PRIMARY KEY,
+                        expiry_time TIMESTAMP WITH TIME ZONE NOT NULL
+                    );
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        user_id BIGINT PRIMARY KEY,
+                        first_name TEXT,
+                        joined_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                    );
+                """)
+                conn.commit()
+            logger.info("✅ Database tables checked/initialized successfully.")
     except Exception as e:
-        if conn:
-            conn.rollback()
         logger.error(f"❌ Database Init Error: {e}")
-    finally:
-        if conn:
-            release_db(conn)
 
 def register_user_db(user_id: int, first_name: str):
-    conn = None
     try:
-        conn = get_db()
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO users (user_id, first_name)
-                VALUES (%s, %s)
-                ON CONFLICT (user_id) DO UPDATE SET first_name = EXCLUDED.first_name;
-            """, (user_id, first_name))
-            conn.commit()
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO users (user_id, first_name)
+                    VALUES (%s, %s)
+                    ON CONFLICT (user_id) DO UPDATE SET first_name = EXCLUDED.first_name;
+                """, (user_id, first_name))
+                conn.commit()
     except Exception as e:
-        if conn:
-            conn.rollback()
         logger.error(f"DB Error (register_user_db): {e}")
-    finally:
-        if conn:
-            release_db(conn)
 
 def get_random_video_db():
-    conn = None
     try:
-        conn = get_db()
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT file_id, caption FROM videos ORDER BY RANDOM() LIMIT 1;")
-            return cur.fetchone()
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT file_id, caption FROM videos ORDER BY RANDOM() LIMIT 1;")
+                return cur.fetchone()
     except Exception as e:
         logger.error(f"DB Error (get_random_video_db): {e}")
         return None
-    finally:
-        if conn:
-            release_db(conn)
 
 def get_video_by_file_id(file_id: str):
-    conn = None
     try:
-        conn = get_db()
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT file_id, caption FROM videos WHERE file_id = %s;", (file_id,))
-            return cur.fetchone()
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT file_id, caption FROM videos WHERE file_id = %s;", (file_id,))
+                return cur.fetchone()
     except Exception as e:
         logger.error(f"DB Error (get_video_by_file_id): {e}")
         return None
-    finally:
-        if conn:
-            release_db(conn)
 
 def is_user_subscribed_db(user_id: int) -> bool:
     if user_id == ADMIN_ID:
         return True
-    conn = None
     try:
-        conn = get_db()
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT expiry_time FROM subscriptions WHERE user_id = %s;", (user_id,))
-            row = cur.fetchone()
-            if not row:
-                return False
-            cur.execute("SELECT (%s > NOW()) as is_valid;", (row['expiry_time'],))
-            res = cur.fetchone()
-            return res['is_valid'] if res else False
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT (expiry_time > NOW()) as is_valid 
+                    FROM subscriptions 
+                    WHERE user_id = %s;
+                """, (user_id,))
+                row = cur.fetchone()
+                return row['is_valid'] if row else False
     except Exception as e:
         logger.error(f"DB Error (is_user_subscribed_db): {e}")
         return False
-    finally:
-        if conn:
-            release_db(conn)
 
 def set_user_subscription_db(user_id: int, hours: int):
-    conn = None
     try:
-        conn = get_db()
-        with conn.cursor() as cur:
-            interval_str = f"{hours} hours"
-            cur.execute("""
-                INSERT INTO subscriptions (user_id, expiry_time)
-                VALUES (%s, NOW() + %s::INTERVAL)
-                ON CONFLICT (user_id) DO UPDATE 
-                SET expiry_time = GREATEST(subscriptions.expiry_time, NOW()) + %s::INTERVAL;
-            """, (user_id, interval_str, interval_str))
-            conn.commit()
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                interval_str = f"{hours} hours"
+                cur.execute("""
+                    INSERT INTO subscriptions (user_id, expiry_time)
+                    VALUES (%s, NOW() + %s::INTERVAL)
+                    ON CONFLICT (user_id) DO UPDATE 
+                    SET expiry_time = GREATEST(subscriptions.expiry_time, NOW()) + %s::INTERVAL;
+                """, (user_id, interval_str, interval_str))
+                conn.commit()
     except Exception as e:
-        if conn:
-            conn.rollback()
         logger.error(f"DB Error (set_user_subscription_db): {e}")
-    finally:
-        if conn:
-            release_db(conn)
 
 def remove_user_subscription_db(user_id: int) -> bool:
-    conn = None
     try:
-        conn = get_db()
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM subscriptions WHERE user_id = %s;", (user_id,))
-            deleted = cur.rowcount > 0
-            conn.commit()
-            return deleted
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM subscriptions WHERE user_id = %s;", (user_id,))
+                deleted = cur.rowcount > 0
+                conn.commit()
+                return deleted
     except Exception as e:
-        if conn:
-            conn.rollback()
         logger.error(f"DB Error (remove_user_subscription_db): {e}")
         return False
-    finally:
-        if conn:
-            release_db(conn)
 
 def get_subscription_details_db(user_id: int):
-    conn = None
     try:
-        conn = get_db()
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT expiry_time FROM subscriptions WHERE user_id = %s;", (user_id,))
-            row = cur.fetchone()
-            return row['expiry_time'].strftime("%Y-%m-%d %H:%M:%S UTC") if row else None
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT expiry_time FROM subscriptions WHERE user_id = %s;", (user_id,))
+                row = cur.fetchone()
+                return row['expiry_time'].strftime("%Y-%m-%d %H:%M:%S UTC") if row else None
     except Exception as e:
         logger.error(f"DB Error (get_subscription_details_db): {e}")
         return None
-    finally:
-        if conn:
-            release_db(conn)
 
 def get_stats_data_db():
-    conn = None
     try:
-        conn = get_db()
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT COUNT(*) as count FROM videos;")
-            v_count = cur.fetchone()['count']
-            cur.execute("SELECT COUNT(*) as count FROM subscriptions WHERE expiry_time > NOW();")
-            u_count = cur.fetchone()['count']
-            cur.execute("SELECT COUNT(*) as count FROM users;")
-            total_users = cur.fetchone()['count']
-            return v_count, u_count, total_users
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT COUNT(*) as count FROM videos;")
+                v_count = cur.fetchone()['count']
+                cur.execute("SELECT COUNT(*) as count FROM subscriptions WHERE expiry_time > NOW();")
+                u_count = cur.fetchone()['count']
+                cur.execute("SELECT COUNT(*) as count FROM users;")
+                total_users = cur.fetchone()['count']
+                return v_count, u_count, total_users
     except Exception as e:
         logger.error(f"DB Error (get_stats_data_db): {e}")
         return 0, 0, 0
-    finally:
-        if conn:
-            release_db(conn)
 
 def get_all_active_users_db():
-    conn = None
     try:
-        conn = get_db()
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT user_id FROM subscriptions WHERE expiry_time > NOW();")
-            return [row['user_id'] for row in cur.fetchall()]
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT user_id FROM subscriptions WHERE expiry_time > NOW();")
+                return [row['user_id'] for row in cur.fetchall()]
     except Exception as e:
         logger.error(f"DB Error (get_all_active_users_db): {e}")
         return []
-    finally:
-        if conn:
-            release_db(conn)
 
 def get_all_users_db():
-    conn = None
     try:
-        conn = get_db()
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT user_id FROM users;")
-            return [row['user_id'] for row in cur.fetchall()]
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT user_id FROM users;")
+                return [row['user_id'] for row in cur.fetchall()]
     except Exception as e:
         logger.error(f"DB Error (get_all_users_db): {e}")
         return []
-    finally:
-        if conn:
-            release_db(conn)
 
 # ---------------------------------------------------------
 # 4. KEYBOARD LAYOUTS
@@ -655,24 +603,18 @@ async def auto_upload_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption = msg.caption or ""
 
     def _quick_db_save():
-        conn = None
         try:
-            conn = get_db()
-            with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO videos (file_id, caption) VALUES (%s, %s) ON CONFLICT (file_id) DO NOTHING;",
-                    (file_id, caption)
-                )
-                conn.commit()
-                return cur.rowcount
+            with get_db_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO videos (file_id, caption) VALUES (%s, %s) ON CONFLICT (file_id) DO NOTHING;",
+                        (file_id, caption)
+                    )
+                    conn.commit()
+                    return cur.rowcount
         except Exception as e:
-            if conn:
-                conn.rollback()
             logger.error(f"Database insertion error: {e}")
             return 0
-        finally:
-            if conn:
-                release_db(conn)
 
     try:
         rows = await asyncio.to_thread(_quick_db_save)
@@ -842,17 +784,16 @@ def main():
 
     app.add_handler(CallbackQueryHandler(handle_approval, pattern="^(app_|rej_)"))
 
-    # Channel and Media Handlers
+    # Channel and Media Handlers (Explicitly allow channel posts)
     app.add_handler(
         MessageHandler(
-            (filters.VIDEO | filters.Document.VIDEO),
+            (filters.VIDEO | filters.Document.VIDEO) & (filters.ChatType.PRIVATE | filters.ChatType.CHANNEL),
             auto_upload_video
         )
     )
     app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, handle_photo_received))
 
     logger.info("Bot is running seamlessly...")
-    # Explicitly set allowed_updates to capture all necessary updates including channel posts
     app.run_polling(allowed_updates=["message", "edited_message", "channel_post", "edited_channel_post", "callback_query"])
 
 if __name__ == "__main__":
