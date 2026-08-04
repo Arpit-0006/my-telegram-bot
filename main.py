@@ -124,7 +124,6 @@ def init_pool():
     if not DATABASE_URL:
         raise ValueError("DATABASE_URL environment variable missing!")
     try:
-        # Use ThreadedConnectionPool for multi-threaded async execution
         db_pool = pool.ThreadedConnectionPool(1, 20, dsn=DATABASE_URL)
         logger.info("✅ Threaded Database Connection Pool initialized successfully.")
     except Exception as e:
@@ -146,10 +145,11 @@ def init_db():
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
+                # Removed UNIQUE constraint from file_id to prevent duplicate blocking issues
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS videos (
                         id SERIAL PRIMARY KEY,
-                        file_id VARCHAR(255) UNIQUE NOT NULL,
+                        file_id VARCHAR(255) NOT NULL,
                         caption TEXT
                     );
                 """)
@@ -198,7 +198,7 @@ def get_video_by_file_id(file_id: str):
     try:
         with get_db_connection() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT file_id, caption FROM videos WHERE file_id = %s;", (file_id,))
+                cur.execute("SELECT file_id, caption FROM videos WHERE file_id = %s LIMIT 1;", (file_id,))
                 return cur.fetchone()
     except Exception as e:
         logger.error(f"DB Error (get_video_by_file_id): {e}")
@@ -607,7 +607,7 @@ async def auto_upload_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             with get_db_connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
-                        "INSERT INTO videos (file_id, caption) VALUES (%s, %s) ON CONFLICT (file_id) DO NOTHING;",
+                        "INSERT INTO videos (file_id, caption) VALUES (%s, %s);",
                         (file_id, caption)
                     )
                     conn.commit()
@@ -621,19 +621,19 @@ async def auto_upload_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if rows > 0:
             if update.message:
-                await update.message.reply_text("Video added in database")
+                await update.message.reply_text("✅ Video added in database")
             elif update.channel_post:
                 logger.info(f"✅ Video successfully added to DB from Channel: {file_id}")
                 await context.bot.send_message(
                     chat_id=update.channel_post.chat.id,
-                    text="Video added in database",
+                    text="✅ Video added in database",
                     reply_to_message_id=update.channel_post.message_id
                 )
         else:
             if update.message:
-                await update.message.reply_text("ℹ️ Ye Video pehle se Database me save hai.")
+                await update.message.reply_text("❌ Failed to save video in database.")
             elif update.channel_post:
-                logger.info(f"ℹ️ Video already exists in DB: {file_id}")
+                logger.error(f"❌ Failed to save video in DB: {file_id}")
 
     except Exception as e:
         logger.error(f"Error processing auto_upload_video: {e}")
@@ -784,7 +784,7 @@ def main():
 
     app.add_handler(CallbackQueryHandler(handle_approval, pattern="^(app_|rej_)"))
 
-    # Channel and Media Handlers (Explicitly allow channel posts)
+    # Channel and Media Handlers
     app.add_handler(
         MessageHandler(
             (filters.VIDEO | filters.Document.VIDEO) & (filters.ChatType.PRIVATE | filters.ChatType.CHANNEL),
