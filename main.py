@@ -92,7 +92,6 @@ def track_message(user_id: int, message_id: int):
         USER_SENT_MESSAGES[user_id] = []
     
     USER_SENT_MESSAGES[user_id].append(message_id)
-    # Memory leak protection: keep only last 50 messages
     if len(USER_SENT_MESSAGES[user_id]) > MAX_TRACKED_MESSAGES_PER_USER:
         USER_SENT_MESSAGES[user_id] = USER_SENT_MESSAGES[user_id][-MAX_TRACKED_MESSAGES_PER_USER:]
 
@@ -108,6 +107,8 @@ async def _silent_delete_job(user_id: int, context: ContextTypes.DEFAULT_TYPE):
         USER_SENT_MESSAGES[user_id] = []
         if user_id in USER_LOCKS:
             del USER_LOCKS[user_id]
+        if user_id in USER_INACTIVITY_TASKS:
+            del USER_INACTIVITY_TASKS[user_id]
     except asyncio.CancelledError:
         pass
     except Exception as e:
@@ -125,15 +126,16 @@ def reset_inactivity_timer(user_id: int, context: ContextTypes.DEFAULT_TYPE):
     USER_INACTIVITY_TASKS[user_id] = task
 
 # ---------------------------------------------------------
-# 3. DATABASE ENGINE (THREAD-SAFE POOL & CONTEXT MANAGER)
+# 3. DATABASE ENGINE
 # ---------------------------------------------------------
 def init_pool():
     global db_pool
     if not DATABASE_URL:
         raise ValueError("DATABASE_URL environment variable missing!")
     try:
-        db_pool = pool.ThreadedConnectionPool(1, 20, dsn=DATABASE_URL)
-        logger.info("✅ Threaded Database Connection Pool initialized successfully.")
+        # Reduced pool size for free database tiers (1 to 5)
+        db_pool = pool.ThreadedConnectionPool(1, 5, dsn=DATABASE_URL)
+        logger.info("✅ Database Connection Pool initialized successfully.")
     except Exception as e:
         logger.error(f"❌ Connection Pool Initialization Error: {e}")
 
@@ -740,7 +742,9 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_type = "all"
         args.pop(0)
 
-    broadcast_msg = html.escape(" ".join(args))
+    raw_text = " ".join(args)
+    broadcast_msg = html.escape(raw_text)
+    
     if not broadcast_msg:
         await update.message.reply_text("⚠️ Content khaali hai! Message likhein.", parse_mode="HTML")
         return
